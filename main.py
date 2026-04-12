@@ -77,8 +77,10 @@ def main():
     # Initialize processor
     processor = None
     try:
+        # Determine overlay setting: --no-overlay flag overrides config, otherwise use config default
+        show_overlay_setting = False if args.no_overlay else None  # None will use config default
         processor = VideoProcessor(camera_index=args.camera, output_file=args.output,
-                                   show_overlay=not args.no_overlay)
+                                   show_overlay=show_overlay_setting)
         processor.initialize_camera()
 
         # Process video
