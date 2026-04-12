@@ -22,8 +22,8 @@ MIN_FACE_SCALE = 0.15  # Minimum portion of frame that should be person
 MAX_FACE_SCALE = 0.7  # Maximum portion of frame that should be person
 
 # Smoothing settings
-SMOOTHING_FACTOR = 0.15  # 0-1, lower = more smoothing (15% of movement per frame)
-MAX_PAN_SPEED = 100  # pixels per frame
+SMOOTHING_FACTOR = 0.10  # 0-1, lower = more smoothing (15% of movement per frame)
+MAX_PAN_SPEED = 50  # pixels per frame
 MAX_ZOOM_SPEED = 0.05  # scale units per frame
 
 # Camera settings
