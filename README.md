@@ -7,6 +7,7 @@ A macOS application that intelligently crops video from a camera device using AI
 - **Real-time pose detection** using MediaPipe (Google's ML Kit equivalent)
 - **4K video support** (up to 4K resolution input)
 - **Intelligent framing** that automatically crops to 16:9 with optimal zoom
+- **Multi-person framing** automatically frames multiple people together with centered panning
 - **Smooth camera movements** using exponential smoothing to eliminate jitter
 - **Live preview** with pose detection visualization
 - **Video output** export to MP4 file format

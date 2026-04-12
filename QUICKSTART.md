@@ -46,10 +46,21 @@ Press **`q`** to exit the preview.
 Edit `config.py` to customize:
 - **SHOT_TYPE** ('medium') - Type of shot: 'full_body', 'waist_up', 'medium', 'close_up'
 - **MAX_ZOOM** (2.5) - Maximum zoom limit
+- **GROUP_FRAMING** (True) - Frame multiple people together if detected
 - **SMOOTHING_FACTOR** (0.15) - Lower = smoother but slower response
 - **PADDING_RATIO** (0.15) - Head space padding around person
 - **MAX_PAN_SPEED** (100) - Maximum camera pan pixels/frame
 - **MAX_ZOOM_SPEED** (0.05) - Maximum zoom change per frame
+
+## Multi-Person Framing
+
+When multiple people are detected in the frame:
+- **Automatic group framing** - Zooms out to fit everyone in the shot
+- **Centered panning** - Frames are centered on the group's center point
+- **Per-person zoom limits** - Respects the SHOT_TYPE setting for the group
+
+To disable group framing and only track the first detected person:
+- Set `GROUP_FRAMING = False` in `config.py`
 
 ## Troubleshooting
 

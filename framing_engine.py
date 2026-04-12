@@ -4,7 +4,8 @@ import cv2
 import numpy as np
 from config import (
     OUTPUT_WIDTH, OUTPUT_HEIGHT, OUTPUT_ASPECT_RATIO,
-    PADDING_RATIO, SHOT_TYPE, SHOT_TYPE_ZOOM, MAX_ZOOM, MIN_FACE_SCALE, MAX_FACE_SCALE
+    PADDING_RATIO, SHOT_TYPE, SHOT_TYPE_ZOOM, MAX_ZOOM, MIN_FACE_SCALE, MAX_FACE_SCALE,
+    GROUP_FRAMING
 )
 
 
@@ -26,7 +27,7 @@ class FramingEngine:
 
     def calculate_crop_box(self, detection_result):
         """
-        Calculate the crop box that frames the person optimally.
+        Calculate the crop box that frames the person(s) optimally.
 
         Args:
             detection_result: Output from PoseDetector.detect()
@@ -34,11 +35,25 @@ class FramingEngine:
         Returns:
             dict: Contains crop coordinates (x, y, w, h), zoom factor, and center
         """
-        if not detection_result['detected'] or detection_result['bbox'] is None:
+        if not detection_result['detected']:
             # Default to center framing if no detection
             return self._get_default_crop()
 
-        x_min, y_min, x_max, y_max = detection_result['bbox']
+        # Check if multiple people detected
+        num_people = detection_result.get('num_people', 1)
+        
+        if GROUP_FRAMING and num_people > 1 and detection_result.get('bboxes'):
+            # Multiple people - frame them all together
+            return self._calculate_group_crop(detection_result['bboxes'])
+        else:
+            # Single person - use standard framing
+            if detection_result['bbox'] is None:
+                return self._get_default_crop()
+            return self._calculate_single_crop(detection_result['bbox'])
+    
+    def _calculate_single_crop(self, bbox):
+        """Calculate crop box for a single person."""
+        x_min, y_min, x_max, y_max = bbox
         
         # Calculate person's bounding box
         person_width = x_max - x_min
@@ -56,9 +71,7 @@ class FramingEngine:
         padded_height = padded_y_max - padded_y_min
 
         # Calculate zoom based on shot type
-        # Get target zoom for the selected shot type
         target_zoom = SHOT_TYPE_ZOOM.get(SHOT_TYPE, SHOT_TYPE_ZOOM['medium'])
-        # Clamp zoom to maximum allowed
         zoom = min(target_zoom, MAX_ZOOM)
 
         # Calculate crop size maintaining 16:9 aspect ratio
@@ -100,6 +113,83 @@ class FramingEngine:
             'center_y': person_center_y,
             'detected_width': person_width,
             'detected_height': person_height
+        }
+    
+    def _calculate_group_crop(self, bboxes):
+        """Calculate crop box to frame multiple people."""
+        if not bboxes:
+            return self._get_default_crop()
+        
+        # Calculate combined bounding box for all people
+        all_x_min = min(bbox[0] for bbox in bboxes)
+        all_y_min = min(bbox[1] for bbox in bboxes)
+        all_x_max = max(bbox[2] for bbox in bboxes)
+        all_y_max = max(bbox[3] for bbox in bboxes)
+        
+        group_width = all_x_max - all_x_min
+        group_height = all_y_max - all_y_min
+        group_center_x = (all_x_min + all_x_max) / 2
+        group_center_y = (all_y_min + all_y_max) / 2
+        
+        # Add padding around the group
+        padded_x_min = max(0, int(all_x_min - group_width * PADDING_RATIO))
+        padded_y_min = max(0, int(all_y_min - group_height * PADDING_RATIO))
+        padded_x_max = min(self.input_width, int(all_x_max + group_width * PADDING_RATIO))
+        padded_y_max = min(self.input_height, int(all_y_max + group_height * PADDING_RATIO))
+        
+        padded_width = padded_x_max - padded_x_min
+        padded_height = padded_y_max - padded_y_min
+        
+        # Calculate zoom to fit group - use no zoom as default for groups
+        # but allow zoom out if needed to fit everyone
+        zoom = 1.0
+        
+        # Calculate crop size maintaining 16:9 aspect ratio
+        crop_width = int(self.output_width / zoom)
+        crop_height = int(self.output_height / zoom)
+        
+        # Ensure aspect ratio is maintained
+        if crop_width / crop_height != OUTPUT_ASPECT_RATIO:
+            crop_height = int(crop_width / OUTPUT_ASPECT_RATIO)
+        
+        # Calculate required zoom to fit the group with padding
+        required_zoom_width = (padded_width + 20) / crop_width if padded_width > 0 else 1.0
+        required_zoom_height = (padded_height + 20) / crop_height if padded_height > 0 else 1.0
+        
+        # Use the minimum zoom needed (maximum of width/height requirements)
+        # Clamp to max zoom
+        zoom = min(max(required_zoom_width, required_zoom_height), MAX_ZOOM)
+        
+        # Recalculate crop size with final zoom
+        crop_width = int(self.output_width / zoom)
+        crop_height = int(self.output_height / zoom)
+        
+        if crop_width / crop_height != OUTPUT_ASPECT_RATIO:
+            crop_height = int(crop_width / OUTPUT_ASPECT_RATIO)
+        
+        # Center on group
+        crop_x = max(0, int(group_center_x - crop_width / 2))
+        crop_y = max(0, int(group_center_y - crop_height / 2))
+        
+        # Ensure crop doesn't exceed frame boundaries
+        crop_x = min(crop_x, self.input_width - crop_width)
+        crop_y = min(crop_y, self.input_height - crop_height)
+        
+        # Clamp to valid range
+        crop_x = max(0, crop_x)
+        crop_y = max(0, crop_y)
+        
+        return {
+            'x': crop_x,
+            'y': crop_y,
+            'width': crop_width,
+            'height': crop_height,
+            'zoom': zoom,
+            'center_x': group_center_x,
+            'center_y': group_center_y,
+            'detected_width': group_width,
+            'detected_height': group_height,
+            'num_people': len(bboxes)
         }
 
     def _get_default_crop(self):

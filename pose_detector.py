@@ -28,13 +28,13 @@ class PoseDetector:
 
     def detect(self, frame):
         """
-        Detect pose landmarks in a frame.
+        Detect pose landmarks in a frame for all people.
 
         Args:
             frame: Input video frame (BGR format from OpenCV)
 
         Returns:
-            dict: Contains 'landmarks', 'bbox', and 'detected' keys
+            dict: Contains 'landmarks', 'bboxes', 'detected', and 'num_people' keys
         """
         h, w, c = frame.shape
         
@@ -44,47 +44,61 @@ class PoseDetector:
         output = {
             'detected': False,
             'landmarks': None,
-            'bbox': None,
+            'bbox': None,  # Keep for backward compatibility (first person)
+            'bboxes': [],  # List of all bboxes
+            'num_people': 0,
             'keypoints': None
         }
         
         if len(results) > 0 and results[0].keypoints is not None:
-            # Get first detected person
             keypoints = results[0].keypoints
             
             if keypoints.data is not None and len(keypoints.data) > 0:
-                # YOLOv8 keypoints format: [x, y, confidence] for each of 17 points
-                kpts = keypoints.data[0]  # First person
-                
-                landmarks = []
-                for kpt in kpts:
-                    x, y, conf = kpt[0].item(), kpt[1].item(), kpt[2].item()
-                    # Normalize to 0-1 range
-                    landmarks.append([x / w, y / h, 0, conf])  # z=0 since YOLO doesn't provide z
-                
-                output['landmarks'] = np.array(landmarks)
+                num_people = len(keypoints.data)
+                output['num_people'] = num_people
                 output['detected'] = True
                 
-                # Calculate bounding box from visible keypoints
-                x_coords = []
-                y_coords = []
+                all_bboxes = []
                 
-                for idx, (x, y, conf) in enumerate(kpts):
-                    if conf > CONFIDENCE_THRESHOLD:
-                        x_coords.append(x.item())
-                        y_coords.append(y.item())
+                # Process all detected people
+                for person_idx in range(num_people):
+                    kpts = keypoints.data[person_idx]  # Keypoints for this person
+                    
+                    # Calculate bounding box from visible keypoints
+                    x_coords = []
+                    y_coords = []
+                    
+                    for idx, (x, y, conf) in enumerate(kpts):
+                        if conf > CONFIDENCE_THRESHOLD:
+                            x_coords.append(x.item())
+                            y_coords.append(y.item())
+                    
+                    if x_coords and y_coords:
+                        x_min, x_max = int(min(x_coords)), int(max(x_coords))
+                        y_min, y_max = int(min(y_coords)), int(max(y_coords))
+                        
+                        # Ensure bbox is within frame
+                        x_min = max(0, x_min)
+                        y_min = max(0, y_min)
+                        x_max = min(w, x_max)
+                        y_max = min(h, y_max)
+                        
+                        all_bboxes.append((x_min, y_min, x_max, y_max))
                 
-                if x_coords and y_coords:
-                    x_min, x_max = int(min(x_coords)), int(max(x_coords))
-                    y_min, y_max = int(min(y_coords)), int(max(y_coords))
+                output['bboxes'] = all_bboxes
+                
+                # Keep first person bbox for backward compatibility
+                if all_bboxes:
+                    output['bbox'] = all_bboxes[0]
                     
-                    # Ensure bbox is within frame
-                    x_min = max(0, x_min)
-                    y_min = max(0, y_min)
-                    x_max = min(w, x_max)
-                    y_max = min(h, y_max)
+                    # Store landmarks for first person (backward compatibility)
+                    kpts = keypoints.data[0]
+                    landmarks = []
+                    for kpt in kpts:
+                        x, y, conf = kpt[0].item(), kpt[1].item(), kpt[2].item()
+                        landmarks.append([x / w, y / h, 0, conf])
                     
-                    output['bbox'] = (x_min, y_min, x_max, y_max)
+                    output['landmarks'] = np.array(landmarks)
                     output['keypoints'] = output['landmarks']
         
         return output
@@ -115,8 +129,18 @@ class PoseDetector:
                 if confidence > CONFIDENCE_THRESHOLD:
                     cv2.circle(frame, (int(x), int(y)), 4, (0, 255, 0), -1)
             
-            # Draw bounding box
-            if detection_result['bbox']:
+            # Draw all bounding boxes
+            num_people = detection_result.get('num_people', 1)
+            bboxes = detection_result.get('bboxes', [])
+            
+            if num_people > 1 and bboxes:
+                # Multiple people - draw all with different colors
+                colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255)]
+                for idx, (x_min, y_min, x_max, y_max) in enumerate(bboxes):
+                    color = colors[idx % len(colors)]
+                    cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), color, 2)
+            elif detection_result['bbox']:
+                # Single person
                 x_min, y_min, x_max, y_max = detection_result['bbox']
                 cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
 
