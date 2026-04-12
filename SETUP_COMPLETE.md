@@ -61,7 +61,8 @@ cd /Users/techbooth/Documents/Autofollow
 
 3. **Adjusting Framing**
    - Edit `config.py` to tweak:
-     - `TARGET_ZOOM`: 1.5 = medium close-up (try 1.2-2.0)
+     - `SHOT_TYPE`: 'medium' = medium close-up (options: 'full_body', 'waist_up', 'medium', 'close_up')
+     - `MAX_ZOOM`: 2.5 = maximum zoom limit
      - `SMOOTHING_FACTOR`: 0.15 = smoothness (0.1 = smoother, 0.3 = more responsive)
      - `PADDING_RATIO`: 0.15 = head space (15% padding)
 

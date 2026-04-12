@@ -44,8 +44,9 @@ Press **`q`** to exit the preview.
 ## Configuration
 
 Edit `config.py` to customize:
+- **SHOT_TYPE** ('medium') - Type of shot: 'full_body', 'waist_up', 'medium', 'close_up'
+- **MAX_ZOOM** (2.5) - Maximum zoom limit
 - **SMOOTHING_FACTOR** (0.15) - Lower = smoother but slower response
-- **TARGET_ZOOM** (1.5) - Higher = tighter frame
 - **PADDING_RATIO** (0.15) - Head space padding around person
 - **MAX_PAN_SPEED** (100) - Maximum camera pan pixels/frame
 - **MAX_ZOOM_SPEED** (0.05) - Maximum zoom change per frame
@@ -66,7 +67,7 @@ Edit `config.py` to customize:
 → Increase `SMOOTHING_FACTOR` in config.py (try 0.25-0.35)
 
 ### Tight framing
-→ Decrease `TARGET_ZOOM` in config.py (try 1.2)
+→ Change `SHOT_TYPE` in config.py to 'full_body' or 'waist_up', or decrease `MAX_ZOOM`
 
 ## System Information
 

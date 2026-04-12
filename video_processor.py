@@ -5,22 +5,24 @@ import numpy as np
 from pose_detector import PoseDetector
 from framing_engine import FramingEngine
 from smoothing import ExponentialSmoother
-from config import DETECTION_INTERVAL, OUTPUT_WIDTH, OUTPUT_HEIGHT
+from config import DETECTION_INTERVAL, OUTPUT_WIDTH, OUTPUT_HEIGHT, SHOW_OVERLAY
 
 
 class VideoProcessor:
     """Main video processing pipeline combining detection, framing, and smoothing."""
 
-    def __init__(self, camera_index=0, output_file=None):
+    def __init__(self, camera_index=0, output_file=None, show_overlay=None):
         """
         Initialize the video processor.
 
         Args:
             camera_index: Camera device index (0 = default camera)
             output_file: Optional path to save output video
+            show_overlay: Whether to show overlay text (uses config default if None)
         """
         self.camera_index = camera_index
         self.output_file = output_file
+        self.show_overlay = show_overlay if show_overlay is not None else SHOW_OVERLAY
         
         # Initialize components
         self.pose_detector = PoseDetector()
@@ -136,11 +138,12 @@ class VideoProcessor:
 
             # Display preview
             if show_preview:
-                # Add frame info
-                info_text = f"Frame: {result['frame_num']} | " \
-                           f"Detected: {'Yes' if result['detection']['detected'] else 'No'}"
-                cv2.putText(cropped_frame, info_text, (10, 30),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                # Add frame info if overlay is enabled
+                if self.show_overlay:
+                    info_text = f"Frame: {result['frame_num']} | " \
+                               f"Detected: {'Yes' if result['detection']['detected'] else 'No'}"
+                    cv2.putText(cropped_frame, info_text, (10, 30),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
                 cv2.imshow('Autofollow - Live Preview', cropped_frame)
 

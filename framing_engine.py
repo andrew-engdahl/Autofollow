@@ -4,12 +4,12 @@ import cv2
 import numpy as np
 from config import (
     OUTPUT_WIDTH, OUTPUT_HEIGHT, OUTPUT_ASPECT_RATIO,
-    PADDING_RATIO, TARGET_ZOOM, MIN_FACE_SCALE, MAX_FACE_SCALE
+    PADDING_RATIO, SHOT_TYPE, SHOT_TYPE_ZOOM, MAX_ZOOM, MIN_FACE_SCALE, MAX_FACE_SCALE
 )
 
 
 class FramingEngine:
-    """Calculates crop region to frame person in 16:9 medium close-up."""
+    """Calculates crop region to frame person with configurable shot type."""
 
     def __init__(self, input_width, input_height):
         """
@@ -55,9 +55,11 @@ class FramingEngine:
         padded_width = padded_x_max - padded_x_min
         padded_height = padded_y_max - padded_y_min
 
-        # Calculate zoom to achieve medium close-up
-        # Target: person takes up ~30-50% of frame (1.5x zoom)
-        zoom = TARGET_ZOOM
+        # Calculate zoom based on shot type
+        # Get target zoom for the selected shot type
+        target_zoom = SHOT_TYPE_ZOOM.get(SHOT_TYPE, SHOT_TYPE_ZOOM['medium'])
+        # Clamp zoom to maximum allowed
+        zoom = min(target_zoom, MAX_ZOOM)
 
         # Calculate crop size maintaining 16:9 aspect ratio
         crop_width = int(self.output_width / zoom)
@@ -67,9 +69,18 @@ class FramingEngine:
         if crop_width / crop_height != OUTPUT_ASPECT_RATIO:
             crop_height = int(crop_width / OUTPUT_ASPECT_RATIO)
 
-        # Center on person with bounds checking
+        # Center on person horizontally
         crop_x = max(0, int(person_center_x - crop_width / 2))
-        crop_y = max(0, int(person_center_y - crop_height / 2))
+
+        # Determine vertical positioning based on whether full body fits
+        if person_height <= crop_height:
+            # Full body fits - center on person vertically
+            crop_y = max(0, int(person_center_y - crop_height / 2))
+        else:
+            # Full body doesn't fit - prioritize head near top
+            # Position head with padding (20% from top) for breathing room
+            head_y_offset = int(crop_height * 0.20)
+            crop_y = max(0, int(y_min - head_y_offset))
 
         # Ensure crop doesn't exceed frame boundaries
         crop_x = min(crop_x, self.input_width - crop_width)

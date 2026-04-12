@@ -130,7 +130,8 @@ OUTPUT_WIDTH = 1920         # Output width (16:9)
 OUTPUT_HEIGHT = 1080
 
 # Framing settings
-TARGET_ZOOM = 1.5           # Zoom level (1.5x = medium close-up)
+SHOT_TYPE = 'medium'        # Shot type: 'full_body', 'waist_up', 'medium', 'close_up'
+MAX_ZOOM = 2.5              # Maximum zoom factor (prevents over-zooming)
 PADDING_RATIO = 0.15        # 15% padding around person
 
 # Smoothing settings
@@ -199,7 +200,7 @@ self.cap.set(cv2.CAP_PROP_FPS, 30)
 ### Real-time Parameter Tuning
 
 Edit config values while running to experiment:
-- Increase `TARGET_ZOOM` for tighter framing
+- Use `--shot-type close_up` for tighter framing, or increase `MAX_ZOOM` in config.py
 - Decrease `SMOOTHING_FACTOR` for smoother but slower response
 - Adjust `PADDING_RATIO` for more/less head space
 
