@@ -17,8 +17,9 @@ POSE_DETECTION_MODEL = 'pose'  # MediaPipe pose detection model
 
 # Framing settings
 PADDING_RATIO = 0.15  # 15% padding around detected person
-SHOT_TYPE = 'waist_up'  # Type of shot: 'full_body', 'waist_up', 'medium', 'close_up'
+SHOT_TYPE = 'medium'  # Type of shot: 'full_body', 'waist_up', 'medium', 'close_up'
 MAX_ZOOM = 4.0  # Maximum zoom factor (prevents over-zooming)
+DEADZONE = 0.4  # Horizontal deadzone (0-1): percentage of current zoom width where subject can move without panning
 
 # Shot type zoom targets (before MAX_ZOOM clamping)
 SHOT_TYPE_ZOOM = {
