@@ -35,6 +35,8 @@ class VideoProcessor:
         self.cap = None
         self.out = None
         self.frame_count = 0
+        self.input_width = None
+        self.input_height = None
         
     def initialize_camera(self):
         """Initialize camera capture."""
@@ -47,6 +49,10 @@ class VideoProcessor:
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = self.cap.get(cv2.CAP_PROP_FPS)
+        
+        # Store input dimensions for coordinate transformation
+        self.input_width = width
+        self.input_height = height
         
         if fps == 0:  # Default FPS if not reported
             fps = 30
@@ -136,6 +142,106 @@ class VideoProcessor:
         # Draw center circle
         cv2.circle(frame, (center_x, center_y), 5, color, thickness)
 
+    def get_torso_center(self, detection):
+        """
+        Calculate the torso center from pose keypoints.
+
+        COCO 17-point format:
+        - Index 5: Left shoulder
+        - Index 6: Right shoulder
+        - Index 11: Left hip
+        - Index 12: Right hip
+
+        Args:
+            detection: Detection dict from pose_detector
+
+        Returns:
+            tuple: (x, y) in original frame coordinates, or None if keypoints unavailable
+        """
+        if not detection.get('keypoints') or not detection.get('detected'):
+            return None
+
+        keypoints = detection['keypoints']
+        
+        # Torso keypoint indices (COCO format)
+        shoulder_indices = [5, 6]  # Left and right shoulders
+        hip_indices = [11, 12]     # Left and right hips
+        
+        torso_points = []
+        
+        # Collect keypoints with sufficient confidence
+        for idx in shoulder_indices + hip_indices:
+            if idx < len(keypoints):
+                x_norm, y_norm, z_norm, conf = keypoints[idx]
+                if conf > 0.3:  # Minimum confidence threshold
+                    # Convert from normalized to pixel coordinates
+                    x = int(x_norm * self.input_width) if self.input_width else 0
+                    y = int(y_norm * self.input_height) if self.input_height else 0
+                    torso_points.append((x, y))
+        
+        if len(torso_points) < 2:
+            return None
+        
+        # Calculate center of torso points
+        center_x = int(sum(p[0] for p in torso_points) / len(torso_points))
+        center_y = int(sum(p[1] for p in torso_points) / len(torso_points))
+        
+        return (center_x, center_y)
+
+    def transform_to_cropped_coords(self, point, crop_box):
+        """
+        Transform a point from original frame coordinates to cropped frame coordinates.
+
+        Args:
+            point: (x, y) in original frame coordinates
+            crop_box: Crop box dict with 'x', 'y', 'zoom' keys
+
+        Returns:
+            tuple: (x, y) in cropped frame coordinates, or None if out of bounds
+        """
+        if point is None:
+            return None
+        
+        orig_x, orig_y = point
+        crop_x = crop_box['x']
+        crop_y = crop_box['y']
+        zoom = crop_box['zoom']
+        
+        # Transform: subtract crop origin and scale by zoom
+        new_x = int((orig_x - crop_x) * zoom)
+        new_y = int((orig_y - crop_y) * zoom)
+        
+        # Check if point is within output bounds
+        if 0 <= new_x < OUTPUT_WIDTH and 0 <= new_y < OUTPUT_HEIGHT:
+            return (new_x, new_y)
+        
+        return None
+
+    def draw_torso_target(self, frame, torso_center_cropped):
+        """
+        Draw a transparent square with red outline at torso center.
+
+        Args:
+            frame: Cropped frame to draw on (modified in-place)
+            torso_center_cropped: (x, y) position in cropped frame coordinates
+        """
+        if torso_center_cropped is None:
+            return
+        
+        x, y = torso_center_cropped
+        size = 40  # Half-size of the square
+        thickness = 2
+        color = (0, 0, 255)  # Red
+        alpha = 0.3  # Transparency
+        
+        # Draw filled transparent square
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x - size, y - size), (x + size, y + size), color, -1)
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        
+        # Draw red outline
+        cv2.rectangle(frame, (x - size, y - size), (x + size, y + size), color, thickness)
+
     def process_video_stream(self, max_frames=None, show_preview=True):
         """
         Process video stream from camera.
@@ -176,6 +282,11 @@ class VideoProcessor:
                 # Draw crosshairs if enabled
                 if self.show_crosshairs:
                     self.draw_crosshairs(cropped_frame)
+                    
+                    # Draw torso target indicator
+                    torso_center = self.get_torso_center(result['detection'])
+                    torso_center_cropped = self.transform_to_cropped_coords(torso_center, result['crop_box'])
+                    self.draw_torso_target(cropped_frame, torso_center_cropped)
 
                 cv2.imshow('Autofollow - Live Preview', cropped_frame)
 
