@@ -1,8 +1,6 @@
 """Configuration settings for the Autofollow app."""
 
-# Video settings
-VIDEO_WIDTH = 1920  # 4K width (supports up to 4K)
-VIDEO_HEIGHT = 1080  # 4K height
+# Video settings (auto-detected from camera)
 VIDEO_FPS = 30
 VIDEO_CODEC = 'mp4v'
 
