@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 from config import (
     OUTPUT_WIDTH, OUTPUT_HEIGHT, OUTPUT_ASPECT_RATIO,
-    PADDING_RATIO, SHOT_TYPE, SHOT_TYPE_ZOOM, MAX_ZOOM, MIN_FACE_SCALE, MAX_FACE_SCALE
+    PADDING_RATIO, SHOT_TYPE, SHOT_TYPE_ZOOM, MAX_ZOOM, MIN_FACE_SCALE, MAX_FACE_SCALE, DEADZONE
 )
 
 
@@ -23,6 +23,7 @@ class FramingEngine:
         self.input_height = input_height
         self.output_width = OUTPUT_WIDTH
         self.output_height = OUTPUT_HEIGHT
+        self.prev_crop_x = None  # Track previous X position for deadzone logic
 
     def calculate_crop_box(self, detection_result):
         """
@@ -69,8 +70,36 @@ class FramingEngine:
         if crop_width / crop_height != OUTPUT_ASPECT_RATIO:
             crop_height = int(crop_width / OUTPUT_ASPECT_RATIO)
 
-        # Center on person horizontally
-        crop_x = max(0, int(person_center_x - crop_width / 2))
+        # Center on person horizontally with deadzone consideration
+        desired_x = max(0, int(person_center_x - crop_width / 2))
+        
+        # Apply deadzone: panning speed increases as subject moves away from center
+        if self.prev_crop_x is not None:
+            # Calculate viewport center and distance from subject
+            viewport_center = self.prev_crop_x + crop_width / 2
+            distance_from_center = abs(person_center_x - viewport_center)
+            half_deadzone = (crop_width * DEADZONE) / 2
+            inner_deadzone = half_deadzone * 0.5  # Strict no-pan zone in the center
+            
+            # Calculate panning speed factor (0 to 1) with quadratic easing
+            if distance_from_center <= inner_deadzone:
+                # Inner deadzone: absolutely no panning
+                pan_speed_factor = 0.0
+            elif distance_from_center <= half_deadzone:
+                # Outer deadzone: gradual ramp from 0 to 1 with quadratic easing
+                normalized_distance = (distance_from_center - inner_deadzone) / (half_deadzone - inner_deadzone)
+                pan_speed_factor = normalized_distance ** 2
+            else:
+                # Outside deadzone: full speed panning
+                pan_speed_factor = 1.0
+            
+            # Interpolate between current and desired position based on speed factor
+            crop_x = self.prev_crop_x + pan_speed_factor * (desired_x - self.prev_crop_x)
+        else:
+            crop_x = desired_x
+        
+        # Store current crop_x for next frame's deadzone calculation
+        self.prev_crop_x = crop_x
 
         # Determine vertical positioning based on whether full body fits
         if person_height <= crop_height:

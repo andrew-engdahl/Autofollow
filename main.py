@@ -11,6 +11,7 @@ Usage:
     python main.py --output output.mp4                  # Save output to file
     python main.py --shot-type full_body                # Full body shot (other options: waist_up, medium, close_up)
     python main.py --max-zoom 3.0                       # Set maximum zoom factor
+    python main.py --deadzone 0.2                       # Set horizontal deadzone (0-1)
     python main.py --no-overlay                         # Hide overlay text
     python main.py --help                               # Show help
 """
@@ -51,6 +52,8 @@ def main():
                        help='Type of shot to frame (default: config value)')
     parser.add_argument('--max-zoom', type=float, default=None,
                        help='Maximum zoom factor (default: config value)')
+    parser.add_argument('--deadzone', type=float, default=None,
+                       help='Horizontal deadzone (0-1, default: config value)')
     parser.add_argument('--no-preview', action='store_true',
                        help='Disable preview window')
     parser.add_argument('--no-overlay', action='store_true',
@@ -66,6 +69,12 @@ def main():
     
     if args.max_zoom:
         config.MAX_ZOOM = args.max_zoom
+    
+    if args.deadzone is not None:
+        if not (0 <= args.deadzone <= 1):
+            print("Error: deadzone must be between 0 and 1", file=sys.stderr)
+            sys.exit(1)
+        config.DEADZONE = args.deadzone
 
     # List available cameras
     if args.list_cameras:
