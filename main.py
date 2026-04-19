@@ -55,6 +55,8 @@ def main():
                        help='Disable preview window')
     parser.add_argument('--no-overlay', action='store_true',
                        help='Disable overlay text on preview')
+    parser.add_argument('--crosshairs', action='store_true',
+                       help='Overlay crosshairs to show camera focus point')
 
     args = parser.parse_args()
 
@@ -80,7 +82,7 @@ def main():
         # Determine overlay setting: --no-overlay flag overrides config, otherwise use config default
         show_overlay_setting = False if args.no_overlay else None  # None will use config default
         processor = VideoProcessor(camera_index=args.camera, output_file=args.output,
-                                   show_overlay=show_overlay_setting)
+                                   show_overlay=show_overlay_setting, show_crosshairs=args.crosshairs)
         processor.initialize_camera()
 
         # Process video

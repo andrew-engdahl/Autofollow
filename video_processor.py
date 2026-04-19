@@ -11,7 +11,7 @@ from config import DETECTION_INTERVAL, OUTPUT_WIDTH, OUTPUT_HEIGHT, SHOW_OVERLAY
 class VideoProcessor:
     """Main video processing pipeline combining detection, framing, and smoothing."""
 
-    def __init__(self, camera_index=0, output_file=None, show_overlay=None):
+    def __init__(self, camera_index=0, output_file=None, show_overlay=None, show_crosshairs=False):
         """
         Initialize the video processor.
 
@@ -19,10 +19,12 @@ class VideoProcessor:
             camera_index: Camera device index (0 = default camera)
             output_file: Optional path to save output video
             show_overlay: Whether to show overlay text (uses config default if None)
+            show_crosshairs: Whether to overlay crosshairs at center of frame
         """
         self.camera_index = camera_index
         self.output_file = output_file
         self.show_overlay = show_overlay if show_overlay is not None else SHOW_OVERLAY
+        self.show_crosshairs = show_crosshairs
         
         # Initialize components
         self.pose_detector = PoseDetector()
@@ -108,6 +110,32 @@ class VideoProcessor:
         self.frame_count += 1
         return output
 
+    def draw_crosshairs(self, frame):
+        """
+        Draw crosshairs at the center of the frame.
+
+        Args:
+            frame: Input frame to draw on (modified in-place)
+        """
+        height, width = frame.shape[:2]
+        center_x, center_y = width // 2, height // 2
+        
+        # Crosshair line length (20% of frame width)
+        line_length = width // 5
+        thickness = 2
+        color = (0, 255, 0)  # Green
+        
+        # Draw horizontal line
+        cv2.line(frame, (center_x - line_length, center_y), 
+                (center_x + line_length, center_y), color, thickness)
+        
+        # Draw vertical line
+        cv2.line(frame, (center_x, center_y - line_length), 
+                (center_x, center_y + line_length), color, thickness)
+        
+        # Draw center circle
+        cv2.circle(frame, (center_x, center_y), 5, color, thickness)
+
     def process_video_stream(self, max_frames=None, show_preview=True):
         """
         Process video stream from camera.
@@ -144,6 +172,10 @@ class VideoProcessor:
                                f"Detected: {'Yes' if result['detection']['detected'] else 'No'}"
                     cv2.putText(cropped_frame, info_text, (10, 30),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Draw crosshairs if enabled
+                if self.show_crosshairs:
+                    self.draw_crosshairs(cropped_frame)
 
                 cv2.imshow('Autofollow - Live Preview', cropped_frame)
 
