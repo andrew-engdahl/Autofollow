@@ -158,10 +158,9 @@ class VideoProcessor:
         Returns:
             tuple: (x, y) in original frame coordinates, or None if keypoints unavailable
         """
-        if not detection.get('keypoints') or not detection.get('detected'):
+        keypoints = detection.get('keypoints')
+        if keypoints is None or not detection.get('detected'):
             return None
-
-        keypoints = detection['keypoints']
         
         # Torso keypoint indices (COCO format)
         shoulder_indices = [5, 6]  # Left and right shoulders
