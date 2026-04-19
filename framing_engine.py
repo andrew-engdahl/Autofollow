@@ -24,6 +24,7 @@ class FramingEngine:
         self.output_width = OUTPUT_WIDTH
         self.output_height = OUTPUT_HEIGHT
         self.prev_crop_x = None  # Track previous X position for deadzone logic
+        self.prev_crop_y = None  # Track previous Y position for smooth vertical movement
 
     def calculate_crop_box(self, detection_result):
         """
@@ -104,12 +105,24 @@ class FramingEngine:
         # Determine vertical positioning based on whether full body fits
         if person_height <= crop_height:
             # Full body fits - center on person vertically
-            crop_y = max(0, int(person_center_y - crop_height / 2))
+            desired_y = max(0, int(person_center_y - crop_height / 2))
         else:
             # Full body doesn't fit - prioritize head near top
             # Position head with padding (20% from top) for breathing room
             head_y_offset = int(crop_height * 0.20)
-            crop_y = max(0, int(y_min - head_y_offset))
+            desired_y = max(0, int(y_min - head_y_offset))
+        
+        # Apply smooth vertical movement to prevent snapping
+        if self.prev_crop_y is not None:
+            # Smooth interpolation: blend between previous and desired position
+            # Using a small smoothing factor for gradual adjustment
+            smooth_factor = 0.15  # 15% movement per frame towards target
+            crop_y = self.prev_crop_y + smooth_factor * (desired_y - self.prev_crop_y)
+        else:
+            crop_y = desired_y
+        
+        # Store current crop_y for next frame's smooth movement
+        self.prev_crop_y = crop_y
 
         # Ensure crop doesn't exceed frame boundaries
         crop_x = min(crop_x, self.input_width - crop_width)

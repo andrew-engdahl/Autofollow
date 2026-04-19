@@ -1,14 +1,14 @@
 """Configuration settings for the Autofollow app."""
 
 # Video settings
-VIDEO_WIDTH = 2560  # 4K width (supports up to 4K)
-VIDEO_HEIGHT = 1440  # 4K height
+VIDEO_WIDTH = 1920  # 4K width (supports up to 4K)
+VIDEO_HEIGHT = 1080  # 4K height
 VIDEO_FPS = 30
 VIDEO_CODEC = 'mp4v'
 
 # Output settings
-OUTPUT_WIDTH = 1920  # 16:9 aspect ratio
-OUTPUT_HEIGHT = 1080
+OUTPUT_WIDTH = 1280  # 16:9 aspect ratio
+OUTPUT_HEIGHT = 720
 OUTPUT_ASPECT_RATIO = 16 / 9  # 16:9
 
 # Pose detection settings
@@ -17,7 +17,7 @@ POSE_DETECTION_MODEL = 'pose'  # MediaPipe pose detection model
 
 # Framing settings
 PADDING_RATIO = 0.15  # 15% padding around detected person
-SHOT_TYPE = 'medium'  # Type of shot: 'full_body', 'waist_up', 'medium', 'close_up'
+SHOT_TYPE = 'waist_up'  # Type of shot: 'full_body', 'waist_up', 'medium', 'close_up'
 MAX_ZOOM = 4.0  # Maximum zoom factor (prevents over-zooming)
 DEADZONE = 0.4  # Horizontal deadzone (0-1): percentage of current zoom width where subject can move without panning
 
