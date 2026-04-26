@@ -25,13 +25,19 @@ A macOS application that intelligently crops video from a camera device using AI
 
 If you don't have Python installed, download from [python.org](https://www.python.org/downloads/)
 
-### 2. Create Virtual Environment & Install Dependencies
+### 2. One-Click Setup
 
-A virtual environment has been set up in the `.venv` directory with all dependencies pre-installed.
+Run the setup script once. It creates the virtual environment and installs all dependencies automatically — safe to re-run, it skips steps that are already done.
+
+```bash
+./setup.sh
+```
+
+That's it. After setup completes, use `./run.sh` to launch the app.
 
 ## Usage
 
-### Quick Start (Using Launcher Script)
+### Quick Start
 
 ```bash
 ./run.sh
@@ -175,14 +181,16 @@ python main.py --camera 1
 
 ```
 Autofollow/
-├── main.py                 # Entry point and CLI
-├── video_processor.py      # Main processing pipeline
-├── pose_detector.py        # Pose detection (MediaPipe)
-├── framing_engine.py       # Crop calculation and framing logic
-├── smoothing.py            # Camera movement smoothing
-├── config.py               # Configuration settings
-├── requirements.txt        # Python dependencies
-└── README.md              # This file
+├── setup.sh               # One-click setup (venv + dependencies)
+├── run.sh                 # Launch the app
+├── main.py                # Entry point and CLI
+├── video_processor.py     # Main processing pipeline
+├── pose_detector.py       # Pose detection (MediaPipe)
+├── framing_engine.py      # Crop calculation and framing logic
+├── smoothing.py           # Camera movement smoothing
+├── config.py              # Configuration settings
+├── requirements.txt       # Python dependencies
+└── README.md             # This file
 ```
 
 ## Advanced Features
