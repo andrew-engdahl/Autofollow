@@ -9,7 +9,7 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QRadioButton, QButtonGroup,
-    QGroupBox, QDoubleSpinBox, QSlider, QSizePolicy, QFrame,
+    QGroupBox, QDoubleSpinBox, QSlider, QSizePolicy, QFrame, QCheckBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker
 from PyQt5.QtGui import QImage, QPixmap, QFont
@@ -21,6 +21,23 @@ from framing_engine import FramingEngine
 from smoothing import PTZSmoother
 from switcher import VirtualSwitcher
 
+
+# ---------------------------------------------------------------------------
+# Diagnostics constants
+# ---------------------------------------------------------------------------
+
+# Standard COCO 17-point skeleton connections (0-indexed)
+_SKELETON = [
+    (0, 1), (0, 2),           # nose → eyes
+    (1, 3), (2, 4),           # eyes → ears
+    (5, 6),                   # shoulder bar
+    (5, 7), (7, 9),           # left arm
+    (6, 8), (8, 10),          # right arm
+    (5, 11), (6, 12),         # torso sides
+    (11, 12),                 # hip bar
+    (11, 13), (13, 15),       # left leg
+    (12, 14), (14, 16),       # right leg
+]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,6 +75,7 @@ class AppState:
         self.crossfade_duration: float = config.CROSSFADE_DURATION
         self.manual_switch_id: str | None = None         # set by UI, consumed by video thread
         self.camera_change_requested: bool = False
+        self.show_diagnostics: bool = config.SHOW_DIAGNOSTICS
 
     def read(self):
         """Return a snapshot of current settings (thread-safe)."""
@@ -72,6 +90,7 @@ class AppState:
                 'crossfade_duration': self.crossfade_duration,
                 'manual_switch_id': self.manual_switch_id,
                 'camera_change_requested': self.camera_change_requested,
+                'show_diagnostics': self.show_diagnostics,
             }
 
     def consume_manual_switch(self) -> str | None:
@@ -205,12 +224,13 @@ class VideoThread(QThread):
 
         mode = settings['tracking_mode']
         shot_type = settings['shot_type']
+        diagnostics = settings.get('show_diagnostics', False)
 
         if mode == 'primary' or not persons:
-            output_frame = self._render_primary(frame, persons, shot_type)
+            output_frame = self._render_primary(frame, persons, shot_type, diagnostics)
             active_id = persons[0].id if persons else 'none'
         else:
-            output_frame, active_id = self._render_switcher(frame, persons, shot_type)
+            output_frame, active_id = self._render_switcher(frame, persons, shot_type, diagnostics)
 
         elapsed = time.monotonic() - t0
         fps = 1.0 / elapsed if elapsed > 0 else 0.0
@@ -223,10 +243,51 @@ class VideoThread(QThread):
         return _bgr_to_qimage(output_frame), meta
 
     # ------------------------------------------------------------------
+    # Diagnostic overlay
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _annotate_frame(frame: np.ndarray, persons, primary_id: str) -> np.ndarray:
+        """Draw skeleton and semi-transparent tracking circles on the input frame.
+
+        Primary person: green.  All others: red.
+        Operates in input-pixel space so the annotation survives any crop/zoom.
+        """
+        h, w = frame.shape[:2]
+
+        # Draw all tracking circles on a copy, then alpha-blend once
+        circle_layer = frame.copy()
+        for person in persons:
+            cx = int((person.bbox[0] + person.bbox[2]) / 2)
+            cy = int((person.bbox[1] + person.bbox[3]) / 2)
+            radius = max(15, int((person.bbox[2] - person.bbox[0]) * 0.18))
+            color = (0, 255, 0) if person.id == primary_id else (0, 0, 255)
+            cv2.circle(circle_layer, (cx, cy), radius, color, -1)
+        out = cv2.addWeighted(circle_layer, 0.35, frame, 0.65, 0)
+
+        # Draw skeleton and keypoint dots (fully opaque) on top
+        for person in persons:
+            skel_color = (0, 220, 0) if person.id == primary_id else (0, 0, 220)
+            kps = person.keypoints  # (17, 4) — [x_norm, y_norm, 0, conf]
+
+            pts: dict[int, tuple[int, int]] = {}
+            for idx, kp in enumerate(kps):
+                if kp[3] > config.CONFIDENCE_THRESHOLD:
+                    pts[idx] = (int(kp[0] * w), int(kp[1] * h))
+
+            for a, b in _SKELETON:
+                if a in pts and b in pts:
+                    cv2.line(out, pts[a], pts[b], skel_color, 2)
+            for pt in pts.values():
+                cv2.circle(out, pt, 4, skel_color, -1)
+
+        return out
+
+    # ------------------------------------------------------------------
     # Render modes
     # ------------------------------------------------------------------
 
-    def _render_primary(self, frame, persons, shot_type):
+    def _render_primary(self, frame, persons, shot_type, diagnostics: bool = False):
         """Track the most-foreground person with a single virtual camera.
 
         Uses hysteresis on primary selection: a new candidate must be at least
@@ -258,9 +319,10 @@ class VideoThread(QThread):
             'primary', tx, ty, tz,
             person_center_x=center_x, crop_width=crop_w
         )
-        return self._framing.apply_crop(frame, sx, sy, sz)
+        src = self._annotate_frame(frame, persons, self._primary_id) if diagnostics else frame
+        return self._framing.apply_crop(src, sx, sy, sz)
 
-    def _render_switcher(self, frame, persons, shot_type):
+    def _render_switcher(self, frame, persons, shot_type, diagnostics: bool = False):
         """Virtual switcher: cut or crossfade between tracked persons.
 
         When a switch is queued the pending person's smoother is advanced every
@@ -268,6 +330,9 @@ class VideoThread(QThread):
         new subject's position by the time the cut or crossfade fires.
         """
         active_id = self._switcher.decide(persons)
+
+        # Annotate input frame once; both active and pending crops share the same overlay
+        src = self._annotate_frame(frame, persons, active_id) if diagnostics else frame
 
         # Render active person
         active_person = next((p for p in persons if p.id == active_id), persons[0])
@@ -278,7 +343,7 @@ class VideoThread(QThread):
             active_id, atx, aty, atz,
             person_center_x=cx_a, crop_width=cw_a
         )
-        frame_active = self._framing.apply_crop(frame, ax, ay, az)
+        frame_active = self._framing.apply_crop(src, ax, ay, az)
 
         # Pretravel: advance the pending smoother off-screen so it's settled
         # before the transition becomes visible; keep showing the active frame.
@@ -307,7 +372,7 @@ class VideoThread(QThread):
                     pending_id, ptx, pty, ptz,
                     person_center_x=cx_p, crop_width=cw_p
                 )
-                frame_pending = self._framing.apply_crop(frame, px, py, pz)
+                frame_pending = self._framing.apply_crop(src, px, py, pz)
                 return self._switcher.blend(frame_active, frame_pending), active_id
 
         return frame_active, active_id
@@ -522,10 +587,22 @@ class ControlWindow(QMainWindow):
 
     def _build_output_section(self):
         box = QGroupBox("Output")
-        row = QHBoxLayout(box)
+        layout = QVBoxLayout(box)
+
+        btn_row = QHBoxLayout()
         btn_fullscreen = QPushButton("Open Fullscreen Output")
         btn_fullscreen.clicked.connect(self._open_fullscreen)
-        row.addWidget(btn_fullscreen)
+        btn_row.addWidget(btn_fullscreen)
+        layout.addLayout(btn_row)
+
+        diag_row = QHBoxLayout()
+        self._diag_checkbox = QCheckBox("Show Diagnostics")
+        self._diag_checkbox.setChecked(self._state.show_diagnostics)
+        self._diag_checkbox.stateChanged.connect(self._on_diagnostics_changed)
+        diag_row.addWidget(self._diag_checkbox)
+        diag_row.addStretch()
+        layout.addLayout(diag_row)
+
         return box
 
     # --- Status bar ---
@@ -614,6 +691,10 @@ class ControlWindow(QMainWindow):
     def _manual_switch(self, person_id: str):
         with QMutexLocker(self._state._lock):
             self._state.manual_switch_id = person_id
+
+    def _on_diagnostics_changed(self, state: int):
+        with QMutexLocker(self._state._lock):
+            self._state.show_diagnostics = bool(state)
 
     def _open_fullscreen(self):
         self._output_win.showFullScreen()
