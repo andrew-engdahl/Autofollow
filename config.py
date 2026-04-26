@@ -29,7 +29,7 @@ SHOT_TYPE_ZOOM = {
     'full_body': 1.0,
     'waist_up': 1.5,
     'medium': 2.0,
-    'close_up': 2.5,
+    'close_up': 2.25,
 }
 
 # PTZ smoothing

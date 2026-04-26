@@ -131,10 +131,16 @@ class VideoThread(QThread):
         self._switcher = VirtualSwitcher()
         self._frame_count = 0
 
-        # Sticky primary: only change the tracked person when the candidate is
-        # significantly more foreground, preventing rapid toggling between two
-        # similarly-sized people in frame.
         self._primary_id: str | None = None
+        # Transition state for Primary Focus mode (mirrors switcher logic)
+        self._primary_pending_id: str | None = None
+        self._primary_pretraveling: bool = False
+        self._primary_pretravel_start: float = 0.0
+        self._primary_fade_start: float | None = None
+        # Wide-shot state: entered when no subjects detected
+        self._wide_shot_active: bool = False
+        self._wide_shot_fade_start: float | None = None   # None = cut already applied
+        self._wide_shot_reacquire_at: float = 0.0         # earliest time to leave wide-shot
 
     # ------------------------------------------------------------------
 
@@ -227,8 +233,8 @@ class VideoThread(QThread):
         diagnostics = settings.get('show_diagnostics', False)
 
         if mode == 'primary' or not persons:
-            output_frame = self._render_primary(frame, persons, shot_type, diagnostics)
-            active_id = persons[0].id if persons else 'none'
+            output_frame = self._render_primary(frame, persons, shot_type, diagnostics, settings)
+            active_id = self._primary_id if self._primary_id else (persons[0].id if persons else 'none')
         else:
             output_frame, active_id = self._render_switcher(frame, persons, shot_type, diagnostics)
 
@@ -248,18 +254,18 @@ class VideoThread(QThread):
 
     @staticmethod
     def _annotate_frame(frame: np.ndarray, persons, primary_id: str) -> np.ndarray:
-        """Draw skeleton and semi-transparent tracking circles on the input frame.
+        """Draw skeleton and torso position box on the input frame.
 
         Primary person: green.  All others: red.
         Operates in input-pixel space so the annotation survives any crop/zoom.
         """
         h, w = frame.shape[:2]
-
         out = frame.copy()
 
-        # Draw skeleton and keypoint dots (fully opaque) on top
         for person in persons:
-            skel_color = (0, 220, 0) if person.id == primary_id else (0, 0, 220)
+            is_primary = person.id == primary_id
+            skel_color = (0, 220, 0) if is_primary else (0, 0, 220)
+            box_color  = (0, 220, 0) if is_primary else (0, 0, 220)
             kps = person.keypoints  # (17, 4) — [x_norm, y_norm, 0, conf]
 
             pts: dict[int, tuple[int, int]] = {}
@@ -271,37 +277,230 @@ class VideoThread(QThread):
                 if a in pts and b in pts:
                     cv2.line(out, pts[a], pts[b], skel_color, 2)
 
+            # --- Torso position box ---
+            # Use shoulder/hip keypoints to define the torso rect; fall back to bbox.
+            torso_kp_indices = [5, 6, 11, 12]  # L-shoulder, R-shoulder, L-hip, R-hip
+            torso_pts = [pts[i] for i in torso_kp_indices if i in pts]
+
+            if len(torso_pts) >= 2:
+                txs = [p[0] for p in torso_pts]
+                tys = [p[1] for p in torso_pts]
+                tx1, ty1, tx2, ty2 = min(txs), min(tys), max(txs), max(tys)
+            else:
+                # Fallback: upper half of bbox
+                bx1, by1, bx2, by2 = person.bbox
+                tx1, ty1, tx2 = bx1, by1, bx2
+                ty2 = by1 + (by2 - by1) // 2
+
+            # Expand the torso rect slightly for readability
+            pad = 8
+            tx1 = max(0, tx1 - pad)
+            ty1 = max(0, ty1 - pad)
+            tx2 = min(w - 1, tx2 + pad)
+            ty2 = min(h - 1, ty2 + pad)
+
+            # Semi-transparent fill
+            overlay = out.copy()
+            cv2.rectangle(overlay, (tx1, ty1), (tx2, ty2), box_color, -1)
+            cv2.addWeighted(overlay, 0.15, out, 0.85, 0, out)
+            cv2.rectangle(out, (tx1, ty1), (tx2, ty2), box_color, 2)
+
+            # X, Y, Z axis values
+            # X: normalised horizontal center of bbox (-1 = left, +1 = right)
+            bx1_, by1_, bx2_, by2_ = person.bbox
+            px_norm = ((bx1_ + bx2_) / 2.0 / max(w, 1) - 0.5) * 2.0
+            # Y: normalised vertical center (−1 = top, +1 = bottom)
+            py_norm = ((by1_ + by2_) / 2.0 / max(h, 1) - 0.5) * 2.0
+            # Z: foreground proxy — bbox area relative to frame (0→1, bigger = closer)
+            pz = person.foreground_score  # already computed in tracker
+
+            label_lines = [
+                f"X:{px_norm:+.2f}",
+                f"Y:{py_norm:+.2f}",
+                f"Z:{pz:.3f}",
+            ]
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale, thickness = 0.45, 1
+            line_h = 14
+            text_x = tx1 + 4
+            text_y = ty1 + line_h
+            for ln in label_lines:
+                cv2.putText(out, ln, (text_x, text_y), font, font_scale,
+                            (0, 0, 0), thickness + 1, cv2.LINE_AA)
+                cv2.putText(out, ln, (text_x, text_y), font, font_scale,
+                            (255, 255, 255), thickness, cv2.LINE_AA)
+                text_y += line_h
+
         return out
 
     # ------------------------------------------------------------------
     # Render modes
     # ------------------------------------------------------------------
 
-    def _render_primary(self, frame, persons, shot_type, diagnostics: bool = False):
-        """Track the most-foreground person with a single virtual camera.
+    def _render_primary(self, frame, persons, shot_type, diagnostics: bool = False,
+                        settings: dict | None = None):
+        """Track the nearest (largest bbox) person as primary.
 
-        Uses hysteresis on primary selection: a new candidate must be at least
-        30% larger (more foreground) than the current primary before we switch,
-        preventing rapid toggling between similarly-sized people.
+        Primary persistence:
+          - Stays on current subject until it leaves the frame entirely.
+          - Switches to a closer subject when foreground_score > current * 1.15
+            (i.e. ~15% bigger bbox area), OR same-distance but 2× more active.
+          - All transitions use the same cut/crossfade pipeline as VirtualSwitcher.
+
+        No-subject wide-shot:
+          - When no persons are detected, crossfade to a full-width wide shot.
+          - After a subject reappears, hold the wide shot for at least xfade_dur
+            seconds before re-acquiring, giving the transition time to breathe.
         """
-        if not persons:
-            tx, ty, tz = self._framing._default_target()
-            sx, sy, sz = self._smoother.update('primary', tx, ty, tz)
-            return self._framing.apply_crop(frame, sx, sy, sz)
+        sw_mode = (settings or {}).get('switch_mode', 'crossfade')
+        xfade_dur = (settings or {}).get('crossfade_duration', self._switcher.crossfade_duration)
+        now = time.monotonic()
 
+        from switcher import _PRETRAVEL_DURATION
+
+        # ----------------------------------------------------------------
+        # Wide-shot fade-in/hold (no subjects detected, or hold period active)
+        # ----------------------------------------------------------------
+        wide_target_x, wide_target_y, wide_target_z = self._framing._default_target()
+
+        entering_wide = not persons and not self._wide_shot_active
+        if entering_wide:
+            self._wide_shot_active = True
+            self._primary_id = None
+            self._primary_pending_id = None
+            self._primary_pretraveling = False
+            self._primary_fade_start = None
+            if sw_mode == 'crossfade':
+                self._wide_shot_fade_start = now
+            else:
+                self._wide_shot_fade_start = None  # immediate cut
+
+        if self._wide_shot_active:
+            # Set earliest re-acquire time whenever we (re-)enter wide-shot
+            if entering_wide:
+                self._wide_shot_reacquire_at = now + xfade_dur
+
+            # Crossfade into the wide shot
+            if self._wide_shot_fade_start is not None:
+                elapsed = now - self._wide_shot_fade_start
+                t = min(1.0, elapsed / max(xfade_dur, 0.001))
+                # Advance the wide-shot smoother
+                wx, wy, wz = self._smoother.update('__wide__', wide_target_x, wide_target_y, wide_target_z)
+                frame_wide = self._framing.apply_crop(frame, wx, wy, wz)
+                if t >= 1.0:
+                    self._wide_shot_fade_start = None  # fade complete
+                    if persons:
+                        # Subject appeared during fade — check hold
+                        if now >= self._wide_shot_reacquire_at:
+                            self._wide_shot_active = False
+                    return frame_wide
+                # Still fading: blend from wherever the primary smoother is
+                px, py, pz = self._smoother.update('primary', wide_target_x, wide_target_y, wide_target_z)
+                frame_from = self._framing.apply_crop(frame, px, py, pz)
+                return cv2.addWeighted(frame_from, 1.0 - t, frame_wide, t, 0)
+
+            # Wide-shot is fully active (fade done)
+            wx, wy, wz = self._smoother.update('__wide__', wide_target_x, wide_target_y, wide_target_z)
+            frame_wide = self._framing.apply_crop(frame, wx, wy, wz)
+
+            if persons and now >= self._wide_shot_reacquire_at:
+                # Hold period elapsed — leave wide-shot and fall through to normal tracking
+                self._wide_shot_active = False
+            else:
+                # Still in hold or no subjects; keep extending the reacquire deadline
+                if not persons:
+                    self._wide_shot_reacquire_at = now + xfade_dur
+                return frame_wide
+
+        # ----------------------------------------------------------------
+        # Normal subject tracking
+        # ----------------------------------------------------------------
         current_ids = {p.id for p in persons}
-        candidate = persons[0]  # highest foreground_score
 
+        # Initialise or recover if primary left the frame
         if self._primary_id not in current_ids:
-            # Current primary left the frame — switch immediately
-            self._primary_id = candidate.id
-        elif candidate.id != self._primary_id:
-            # Current primary still present; only switch if candidate is meaningfully larger
-            current_p = next(p for p in persons if p.id == self._primary_id)
-            if candidate.foreground_score > current_p.foreground_score * 1.30:
-                self._primary_id = candidate.id
+            self._primary_id = persons[0].id
+            self._primary_pending_id = None
+            self._primary_pretraveling = False
+            self._primary_fade_start = None
 
-        primary = next((p for p in persons if p.id == self._primary_id), candidate)
+        current_p = next((p for p in persons if p.id == self._primary_id), persons[0])
+
+        # --- Candidate selection: nearest first, activity as tiebreaker ---
+        # persons[] is sorted foreground_score desc (nearest = persons[0])
+        nearest = persons[0]
+        if nearest.id != self._primary_id and self._primary_pending_id is None:
+            fg_ratio = nearest.foreground_score / max(current_p.foreground_score, 1e-6)
+            act_ratio = nearest.activity_score / max(current_p.activity_score, 1e-6)
+            # 15% bigger bbox = clearly closer; or similar distance but 2× more active
+            if fg_ratio >= 1.15 or (fg_ratio >= 0.85 and act_ratio >= 2.0):
+                self._primary_pending_id = nearest.id
+                self._primary_pretraveling = True
+                self._primary_pretravel_start = now
+                self._primary_fade_start = None
+
+        # --- Phase 1: pretravel ---
+        if self._primary_pretraveling:
+            pending_person = next((p for p in persons if p.id == self._primary_pending_id), None)
+            if pending_person:
+                ptx, pty, ptz = self._framing.calculate_target(pending_person, shot_type)
+                cx_p = (pending_person.bbox[0] + pending_person.bbox[2]) / 2.0
+                cw_p = config.OUTPUT_WIDTH / ptz
+                self._smoother.update(self._primary_pending_id, ptx, pty, ptz,
+                                      person_center_x=cx_p, crop_width=cw_p)
+            if now - self._primary_pretravel_start >= _PRETRAVEL_DURATION:
+                self._primary_pretraveling = False
+                if sw_mode == 'cut':
+                    self._primary_id = self._primary_pending_id
+                    self._primary_pending_id = None
+                else:
+                    self._primary_fade_start = now
+            src = self._annotate_frame(frame, persons, self._primary_id) if diagnostics else frame
+            primary = next((p for p in persons if p.id == self._primary_id), persons[0])
+            tx, ty, tz = self._framing.calculate_target(primary, shot_type)
+            cx = (primary.bbox[0] + primary.bbox[2]) / 2.0
+            cw = config.OUTPUT_WIDTH / tz
+            sx, sy, sz = self._smoother.update('primary', tx, ty, tz,
+                                               person_center_x=cx, crop_width=cw)
+            return self._framing.apply_crop(src, sx, sy, sz)
+
+        # --- Phase 2: crossfade to new primary ---
+        if self._primary_pending_id is not None and self._primary_fade_start is not None:
+            elapsed = now - self._primary_fade_start
+            t = min(1.0, elapsed / max(xfade_dur, 0.001))
+
+            src = self._annotate_frame(frame, persons, self._primary_id) if diagnostics else frame
+
+            primary = next((p for p in persons if p.id == self._primary_id), persons[0])
+            atx, aty, atz = self._framing.calculate_target(primary, shot_type)
+            cx_a = (primary.bbox[0] + primary.bbox[2]) / 2.0
+            cw_a = config.OUTPUT_WIDTH / atz
+            ax, ay, az = self._smoother.update('primary', atx, aty, atz,
+                                               person_center_x=cx_a, crop_width=cw_a)
+            frame_active = self._framing.apply_crop(src, ax, ay, az)
+
+            pending_person = next((p for p in persons if p.id == self._primary_pending_id), None)
+            if pending_person:
+                ptx, pty, ptz = self._framing.calculate_target(pending_person, shot_type)
+                cx_p = (pending_person.bbox[0] + pending_person.bbox[2]) / 2.0
+                cw_p = config.OUTPUT_WIDTH / ptz
+                px, py, pz = self._smoother.update(self._primary_pending_id, ptx, pty, ptz,
+                                                   person_center_x=cx_p, crop_width=cw_p)
+                frame_pending = self._framing.apply_crop(src, px, py, pz)
+                blended = cv2.addWeighted(frame_active, 1.0 - t, frame_pending, t, 0)
+            else:
+                blended = frame_active
+                t = 1.0
+
+            if t >= 1.0:
+                self._primary_id = self._primary_pending_id
+                self._primary_pending_id = None
+                self._primary_fade_start = None
+
+            return blended
+
+        # --- Steady state: follow primary ---
+        primary = next((p for p in persons if p.id == self._primary_id), persons[0])
         tx, ty, tz = self._framing.calculate_target(primary, shot_type)
         center_x = (primary.bbox[0] + primary.bbox[2]) / 2.0
         crop_w = config.OUTPUT_WIDTH / tz
@@ -433,7 +632,6 @@ class ControlWindow(QMainWindow):
         layout.setSpacing(8)
 
         layout.addWidget(self._build_camera_section())
-        layout.addWidget(self._build_mode_section())
         layout.addWidget(self._build_shot_section())
         layout.addWidget(self._build_switcher_section())
         layout.addWidget(self._preview_label)
@@ -470,23 +668,6 @@ class ControlWindow(QMainWindow):
                 break
         self._cam_combo.blockSignals(False)
 
-    # --- Mode ---
-
-    def _build_mode_section(self):
-        box = QGroupBox("Tracking Mode")
-        row = QHBoxLayout(box)
-        self._mode_group = QButtonGroup()
-        rb_primary = QRadioButton("Primary Focus")
-        rb_switcher = QRadioButton("Virtual Switcher")
-        rb_primary.setChecked(self._state.tracking_mode == 'primary')
-        rb_switcher.setChecked(self._state.tracking_mode == 'switcher')
-        self._mode_group.addButton(rb_primary, 0)
-        self._mode_group.addButton(rb_switcher, 1)
-        self._mode_group.buttonClicked.connect(self._on_mode_changed)
-        row.addWidget(rb_primary)
-        row.addWidget(rb_switcher)
-        return box
-
     # --- Shot type ---
 
     def _build_shot_section(self):
@@ -505,27 +686,39 @@ class ControlWindow(QMainWindow):
         row.addWidget(self._shot_combo)
         return box
 
-    # --- Switcher settings ---
+    # --- Virtual Switcher / Primary Focus settings ---
 
     def _build_switcher_section(self):
-        self._switcher_box = QGroupBox("Virtual Switcher Settings")
+        # No section label — title is implicit from context
+        self._switcher_box = QGroupBox("Virtual Switcher")
         layout = QVBoxLayout(self._switcher_box)
 
-        # Trigger
+        # Trigger row — Primary Focus first, then switcher triggers
         trig_row = QHBoxLayout()
-        trig_label = QLabel("Trigger:")
+        trig_label = QLabel("Mode:")
         self._trig_group = QButtonGroup()
-        for label, key in [("Time", "time"), ("Activity", "activity"), ("Manual", "manual")]:
+        triggers = [
+            ("Primary Focus", "primary"),
+            ("Time",          "time"),
+            ("Activity",      "activity"),
+            ("Manual",        "manual"),
+        ]
+        # Determine initial checked state: 'primary' maps to tracking_mode, others to switch_trigger
+        current_trigger = (
+            "primary" if self._state.tracking_mode == 'primary'
+            else self._state.switch_trigger
+        )
+        for label, key in triggers:
             rb = QRadioButton(label)
             rb.setProperty("trigger_key", key)
-            rb.setChecked(key == self._state.switch_trigger)
+            rb.setChecked(key == current_trigger)
             self._trig_group.addButton(rb)
             trig_row.addWidget(rb)
         self._trig_group.buttonClicked.connect(self._on_trigger_changed)
         trig_row.insertWidget(0, trig_label)
         layout.addLayout(trig_row)
 
-        # Interval (time trigger)
+        # Interval (time trigger only)
         int_row = QHBoxLayout()
         self._interval_label = QLabel("Interval (s):")
         self._interval_spin = QDoubleSpinBox()
@@ -537,7 +730,7 @@ class ControlWindow(QMainWindow):
         int_row.addWidget(self._interval_spin)
         layout.addLayout(int_row)
 
-        # Switch mode
+        # Transition mode
         sm_row = QHBoxLayout()
         sm_label = QLabel("Transition:")
         self._sm_group = QButtonGroup()
@@ -570,7 +763,7 @@ class ControlWindow(QMainWindow):
         layout.addLayout(self._persons_row)
         self._person_buttons: dict[str, QPushButton] = {}
 
-        self._switcher_box.setVisible(self._state.tracking_mode == 'switcher')
+        self._update_trigger_ui(current_trigger)
         return self._switcher_box
 
     # --- Output ---
@@ -635,9 +828,11 @@ class ControlWindow(QMainWindow):
             self._persons_row.removeWidget(btn)
             btn.deleteLater()
 
+        manual_active = self._state.switch_trigger == 'manual' and self._state.tracking_mode == 'switcher'
         for pid in current - existing:
             btn = QPushButton(pid.replace('person', 'P'))
             btn.setFixedWidth(40)
+            btn.setVisible(manual_active)
             btn.clicked.connect(lambda checked, p=pid: self._manual_switch(p))
             self._person_buttons[pid] = btn
             self._persons_row.addWidget(btn)
@@ -649,12 +844,6 @@ class ControlWindow(QMainWindow):
                 self._state.camera_index = cam_idx
                 self._state.camera_change_requested = True
 
-    def _on_mode_changed(self, button):
-        mode = 'primary' if self._mode_group.id(button) == 0 else 'switcher'
-        with QMutexLocker(self._state._lock):
-            self._state.tracking_mode = mode
-        self._switcher_box.setVisible(mode == 'switcher')
-
     def _on_shot_changed(self, idx: int):
         key = self._shot_combo.itemData(idx)
         with QMutexLocker(self._state._lock):
@@ -662,8 +851,24 @@ class ControlWindow(QMainWindow):
 
     def _on_trigger_changed(self, button):
         key = button.property("trigger_key")
-        with QMutexLocker(self._state._lock):
-            self._state.switch_trigger = key
+        if key == 'primary':
+            with QMutexLocker(self._state._lock):
+                self._state.tracking_mode = 'primary'
+        else:
+            with QMutexLocker(self._state._lock):
+                self._state.tracking_mode = 'switcher'
+                self._state.switch_trigger = key
+        self._update_trigger_ui(key)
+
+    def _update_trigger_ui(self, trigger_key: str):
+        """Show/hide interval row based on selected trigger."""
+        show_interval = trigger_key == 'time'
+        self._interval_label.setVisible(show_interval)
+        self._interval_spin.setVisible(show_interval)
+        # Manual person buttons are only meaningful in manual switcher mode
+        manual_active = trigger_key == 'manual'
+        for btn in self._person_buttons.values():
+            btn.setVisible(manual_active)
 
     def _on_interval_changed(self, val: float):
         with QMutexLocker(self._state._lock):
