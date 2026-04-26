@@ -1,47 +1,46 @@
 """Configuration settings for the Autofollow app."""
 
-# Video settings (auto-detected from camera)
-VIDEO_FPS = 30
-VIDEO_CODEC = 'mp4v'
-
-# Output settings
-OUTPUT_WIDTH = 1280  # 16:9 aspect ratio
+# Output resolution (16:9)
+OUTPUT_WIDTH = 1280
 OUTPUT_HEIGHT = 720
-OUTPUT_ASPECT_RATIO = 16 / 9  # 16:9
+OUTPUT_ASPECT_RATIO = 16 / 9
 
-# Pose detection settings
+# Pose detection
 CONFIDENCE_THRESHOLD = 0.5
-POSE_DETECTION_MODEL = 'pose'  # MediaPipe pose detection model
+YOLO_MODEL = 'yolov8n-pose.pt'   # nano=n, small=s, medium=m, large=l
+DETECTION_SCALE = 0.5             # Run YOLO on this fraction of input resolution (0.25–1.0)
+DETECTION_INTERVAL = 1            # Run pose detection every N frames (1 = every frame)
+MAX_PERSONS = 5                   # Maximum simultaneous tracked people
 
-# Framing settings
-PADDING_RATIO = 0.15  # 15% padding around detected person
-SHOT_TYPE = 'waist_up'  # Type of shot: 'full_body', 'waist_up', 'medium', 'close_up'
-MAX_ZOOM = 4.0  # Maximum zoom factor (prevents over-zooming)
-DEADZONE = 0.4  # Horizontal deadzone (0-1): percentage of current zoom width where subject can move without panning
+# Framing
+PADDING_RATIO = 0.15              # Padding around detected person bounding box
+SHOT_TYPE = 'waist_up'           # 'full_body' | 'waist_up' | 'medium' | 'close_up'
+MAX_ZOOM = 4.0                    # Maximum zoom factor
+DEADZONE = 0.4                    # Horizontal deadzone (0–1): fraction of viewport where subject moves without panning
 
-# Shot type zoom targets (before MAX_ZOOM clamping)
 SHOT_TYPE_ZOOM = {
-    'full_body': 1.0,   # Show entire person, no zoom
-    'waist_up': 1.5,    # Show waist/hips to head
-    'medium': 2.0,      # Show chest/shoulders to head
-    'close_up': 2.5,    # Show head and shoulders only
+    'full_body': 1.0,
+    'waist_up': 1.5,
+    'medium': 2.0,
+    'close_up': 2.5,
 }
 
-MIN_FACE_SCALE = 0.15  # Minimum portion of frame that should be person
-MAX_FACE_SCALE = 0.35  # Maximum portion of frame that should be person
+# PTZ smoothing
+SMOOTHING_FACTOR = 0.05           # Minimum easing factor (close to target)
+MAX_PAN_SPEED = 30                # Maximum pan movement in pixels per frame
+MAX_ZOOM_SPEED = 0.05             # Maximum zoom change per frame
 
-# Smoothing settings
-SMOOTHING_FACTOR = 0.05  # 0-1, lower = more smoothing (% of movement per frame)
-MAX_PAN_SPEED = 50  # pixels per frame
-MAX_ZOOM_SPEED = 0.05  # scale units per frame
+# Camera
+CAMERA_INDEX = 0                  # Default camera device (0 = built-in)
 
-# Camera settings
-CAMERA_INDEX = 0  # Default camera device (0 = built-in webcam)
-AUTO_CAMERA_DETECT = True  # Try to find best available camera
+# Tracking mode
+TRACKING_MODE = 'primary'         # 'primary' (follow foreground person) | 'switcher' (virtual switching)
 
-# UI settings
-SHOW_OVERLAY = False  # Show frame info overlay text
+# Virtual switcher
+SWITCH_MODE = 'crossfade'               # 'cut' | 'crossfade'
+SWITCH_TRIGGER = 'time'           # 'time' | 'activity' | 'manual'
+SWITCH_INTERVAL = 8.0             # Seconds between auto-switches (time trigger)
+CROSSFADE_DURATION = 1.0          # Seconds for crossfade transition
 
-# Performance settings
-SKIP_FRAMES = 0  # Process every Nth frame (0 = process every frame)
-DETECTION_INTERVAL = 1  # Run pose detection every N frames
+# UI
+SHOW_OVERLAY = False              # Show frame info overlay text

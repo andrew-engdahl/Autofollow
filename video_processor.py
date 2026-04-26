@@ -1,320 +1,146 @@
-"""Main video processing pipeline."""
+"""Headless video processor — usable standalone (CLI) or embedded in VideoThread."""
 
 import cv2
 import numpy as np
+from config import (
+    OUTPUT_WIDTH, OUTPUT_HEIGHT, DETECTION_INTERVAL, SHOW_OVERLAY,
+)
 from pose_detector import PoseDetector
+from tracker import PersonTracker
 from framing_engine import FramingEngine
-from smoothing import ExponentialSmoother
-from config import DETECTION_INTERVAL, OUTPUT_WIDTH, OUTPUT_HEIGHT, SHOW_OVERLAY
+from smoothing import PTZSmoother
+import config
 
 
 class VideoProcessor:
-    """Main video processing pipeline combining detection, framing, and smoothing."""
+    """Processes a camera stream and produces cropped output frames.
 
-    def __init__(self, camera_index=0, output_file=None, show_overlay=None, show_crosshairs=False):
-        """
-        Initialize the video processor.
+    This class handles the pure processing logic. For the GUI path the
+    VideoThread in control_ui.py drives it; for CLI use, call
+    process_video_stream() directly.
+    """
 
-        Args:
-            camera_index: Camera device index (0 = default camera)
-            output_file: Optional path to save output video
-            show_overlay: Whether to show overlay text (uses config default if None)
-            show_crosshairs: Whether to overlay crosshairs at center of frame
-        """
+    def __init__(self, camera_index: int = 0, output_file: str | None = None,
+                 show_overlay: bool | None = None):
         self.camera_index = camera_index
         self.output_file = output_file
         self.show_overlay = show_overlay if show_overlay is not None else SHOW_OVERLAY
-        self.show_crosshairs = show_crosshairs
-        
-        # Initialize components
-        self.pose_detector = PoseDetector()
-        self.framing_engine = None
-        self.smoother = ExponentialSmoother()
-        
-        # Video capture
-        self.cap = None
-        self.out = None
-        self.frame_count = 0
-        self.input_width = None
-        self.input_height = None
-        
+
+        self._detector = PoseDetector()
+        self._tracker = PersonTracker()
+        self._framing: FramingEngine | None = None
+        self._smoother = PTZSmoother()
+
+        self._cap = None
+        self._out = None
+        self._frame_count = 0
+        self.input_width: int | None = None
+        self.input_height: int | None = None
+
     def initialize_camera(self):
-        """Initialize camera capture."""
-        self.cap = cv2.VideoCapture(self.camera_index)
-        
-        if not self.cap.isOpened():
+        """Open camera and prepare output writer."""
+        self._cap = cv2.VideoCapture(self.camera_index)
+        if not self._cap.isOpened():
             raise RuntimeError(f"Failed to open camera device {self.camera_index}")
-        
-        # Get video properties
-        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
-        
-        # Store input dimensions for coordinate transformation
-        self.input_width = width
-        self.input_height = height
-        
-        if fps == 0:  # Default FPS if not reported
-            fps = 30
-            
-        print(f"Camera initialized: {width}x{height} @ {fps:.1f}fps")
-        
-        # Initialize framing engine with actual input dimensions
-        self.framing_engine = FramingEngine(width, height)
-        
-        # Initialize video writer if output file specified
+
+        w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = self._cap.get(cv2.CAP_PROP_FPS) or 30
+
+        self.input_width = w
+        self.input_height = h
+        self._framing = FramingEngine(w, h)
+
+        print(f"Camera: {w}×{h} @ {fps:.1f} fps")
+
         if self.output_file:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.out = cv2.VideoWriter(self.output_file, fourcc, fps, 
-                                      (OUTPUT_WIDTH, OUTPUT_HEIGHT))
-            if not self.out.isOpened():
-                print(f"Warning: Could not open video writer for {self.output_file}")
-                self.out = None
+            self._out = cv2.VideoWriter(self.output_file, fourcc, fps,
+                                        (OUTPUT_WIDTH, OUTPUT_HEIGHT))
 
-        return width, height, fps
+        return w, h, fps
 
-    def process_frame(self, frame):
+    def process_frame(self, frame: np.ndarray) -> dict:
+        """Run the full pipeline on a single frame.
+
+        Returns a dict with 'frame' (cropped output), 'persons', 'active_id'.
         """
-        Process a single frame through the pipeline.
-
-        Args:
-            frame: Input video frame
-
-        Returns:
-            dict: Processed output and metadata
-        """
-        # Run pose detection every N frames
-        if self.frame_count % DETECTION_INTERVAL == 0:
-            detection = self.pose_detector.detect(frame)
+        if self._frame_count % DETECTION_INTERVAL == 0:
+            detections = self._detector.detect(frame)
         else:
-            detection = {'detected': False, 'bbox': None}
+            detections = []
 
-        # Calculate optimal crop box
-        crop_box = self.framing_engine.calculate_crop_box(detection)
+        persons = self._tracker.update(detections, frame.shape)
 
-        # Apply smoothing to crop parameters
-        smoothed_x, smoothed_y, smoothed_zoom = self.smoother.smooth(
-            crop_box['x'], crop_box['y'], crop_box['zoom']
-        )
+        mode = config.TRACKING_MODE
+        if mode == 'primary' or not persons:
+            output_frame, active_id = self._render_primary(frame, persons)
+        else:
+            output_frame, active_id = self._render_primary(frame, persons)
 
-        # Update crop box with smoothed values
-        crop_box['x'] = smoothed_x
-        crop_box['y'] = smoothed_y
-        crop_box['zoom'] = smoothed_zoom
+        if self.show_overlay:
+            n = len(persons)
+            cv2.putText(output_frame,
+                        f"Frame {self._frame_count} | {n} person(s) | {active_id}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        # Apply crop and resize
-        cropped_frame = self.framing_engine.apply_crop(frame, crop_box)
+        self._frame_count += 1
+        return {'frame': output_frame, 'persons': persons, 'active_id': active_id}
 
-        # Prepare output info
-        output = {
-            'frame': cropped_frame,
-            'detection': detection,
-            'crop_box': crop_box,
-            'frame_num': self.frame_count
-        }
+    def _render_primary(self, frame, persons):
+        if not persons:
+            tx, ty, tz = self._framing._default_target()
+            sx, sy, sz = self._smoother.update('primary', tx, ty, tz)
+        else:
+            primary = persons[0]
+            tx, ty, tz = self._framing.calculate_target(primary)
+            cx = (primary.bbox[0] + primary.bbox[2]) / 2.0
+            cw = OUTPUT_WIDTH / tz
+            sx, sy, sz = self._smoother.update(
+                'primary', tx, ty, tz, person_center_x=cx, crop_width=cw
+            )
+        return self._framing.apply_crop(frame, sx, sy, sz), \
+               persons[0].id if persons else 'none'
 
-        self.frame_count += 1
-        return output
-
-    def draw_crosshairs(self, frame):
-        """
-        Draw crosshairs at the center of the frame.
-
-        Args:
-            frame: Input frame to draw on (modified in-place)
-        """
-        height, width = frame.shape[:2]
-        center_x, center_y = width // 2, height // 2
-        
-        # Crosshair line length (20% of frame width)
-        line_length = width // 5
-        thickness = 2
-        color = (0, 255, 0)  # Green
-        
-        # Draw horizontal line
-        cv2.line(frame, (center_x - line_length, center_y), 
-                (center_x + line_length, center_y), color, thickness)
-        
-        # Draw vertical line
-        cv2.line(frame, (center_x, center_y - line_length), 
-                (center_x, center_y + line_length), color, thickness)
-        
-        # Draw center circle
-        cv2.circle(frame, (center_x, center_y), 5, color, thickness)
-
-    def get_torso_center(self, detection):
-        """
-        Calculate the torso center from pose keypoints.
-
-        COCO 17-point format:
-        - Index 5: Left shoulder
-        - Index 6: Right shoulder
-        - Index 11: Left hip
-        - Index 12: Right hip
-
-        Args:
-            detection: Detection dict from pose_detector
-
-        Returns:
-            tuple: (x, y) in original frame coordinates, or None if keypoints unavailable
-        """
-        keypoints = detection.get('keypoints')
-        if keypoints is None or not detection.get('detected'):
-            return None
-        
-        # Torso keypoint indices (COCO format)
-        shoulder_indices = [5, 6]  # Left and right shoulders
-        hip_indices = [11, 12]     # Left and right hips
-        
-        torso_points = []
-        
-        # Collect keypoints with sufficient confidence
-        for idx in shoulder_indices + hip_indices:
-            if idx < len(keypoints):
-                x_norm, y_norm, z_norm, conf = keypoints[idx]
-                if conf > 0.3:  # Minimum confidence threshold
-                    # Convert from normalized to pixel coordinates
-                    x = int(x_norm * self.input_width) if self.input_width else 0
-                    y = int(y_norm * self.input_height) if self.input_height else 0
-                    torso_points.append((x, y))
-        
-        if len(torso_points) < 2:
-            return None
-        
-        # Calculate center of torso points
-        center_x = int(sum(p[0] for p in torso_points) / len(torso_points))
-        center_y = int(sum(p[1] for p in torso_points) / len(torso_points))
-        
-        return (center_x, center_y)
-
-    def transform_to_cropped_coords(self, point, crop_box):
-        """
-        Transform a point from original frame coordinates to cropped frame coordinates.
-
-        Args:
-            point: (x, y) in original frame coordinates
-            crop_box: Crop box dict with 'x', 'y', 'zoom' keys
-
-        Returns:
-            tuple: (x, y) in cropped frame coordinates, or None if out of bounds
-        """
-        if point is None:
-            return None
-        
-        orig_x, orig_y = point
-        crop_x = crop_box['x']
-        crop_y = crop_box['y']
-        zoom = crop_box['zoom']
-        
-        # Transform: subtract crop origin and scale by zoom
-        new_x = int((orig_x - crop_x) * zoom)
-        new_y = int((orig_y - crop_y) * zoom)
-        
-        # Check if point is within output bounds
-        if 0 <= new_x < OUTPUT_WIDTH and 0 <= new_y < OUTPUT_HEIGHT:
-            return (new_x, new_y)
-        
-        return None
-
-    def draw_torso_target(self, frame, torso_center_cropped):
-        """
-        Draw a transparent square with red outline at torso center.
-
-        Args:
-            frame: Cropped frame to draw on (modified in-place)
-            torso_center_cropped: (x, y) position in cropped frame coordinates
-        """
-        if torso_center_cropped is None:
-            return
-        
-        x, y = torso_center_cropped
-        size = 40  # Half-size of the square
-        thickness = 2
-        color = (0, 0, 255)  # Red
-        alpha = 0.3  # Transparency
-        
-        # Draw filled transparent square
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (x - size, y - size), (x + size, y + size), color, -1)
-        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-        
-        # Draw red outline
-        cv2.rectangle(frame, (x - size, y - size), (x + size, y + size), color, thickness)
-
-    def process_video_stream(self, max_frames=None, show_preview=True):
-        """
-        Process video stream from camera.
-
-        Args:
-            max_frames: Maximum frames to process (None = continuous)
-            show_preview: Whether to display preview window
-
-        Returns:
-            stats: Processing statistics
-        """
-        print("Starting video processing... Press 'q' to quit")
-        
+    def process_video_stream(self, max_frames: int | None = None,
+                             show_preview: bool = True) -> dict:
+        """CLI entry point: run the capture loop until 'q' or max_frames."""
+        print("Starting… press 'q' to quit")
         frame_num = 0
+
         while True:
-            ret, frame = self.cap.read()
+            ret, frame = self._cap.read()
             if not ret:
-                print("Failed to read frame")
                 break
 
-            # Process frame
             result = self.process_frame(frame)
-            cropped_frame = result['frame']
+            cropped = result['frame']
 
-            # Write to output file
-            if self.out:
-                self.out.write(cropped_frame)
+            if self._out:
+                self._out.write(cropped)
 
-            # Display preview
             if show_preview:
-                # Add frame info if overlay is enabled
-                if self.show_overlay:
-                    info_text = f"Frame: {result['frame_num']} | " \
-                               f"Detected: {'Yes' if result['detection']['detected'] else 'No'}"
-                    cv2.putText(cropped_frame, info_text, (10, 30),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                # Draw crosshairs if enabled
-                if self.show_crosshairs:
-                    self.draw_crosshairs(cropped_frame)
-                    
-                    # Draw torso target indicator
-                    torso_center = self.get_torso_center(result['detection'])
-                    torso_center_cropped = self.transform_to_cropped_coords(torso_center, result['crop_box'])
-                    self.draw_torso_target(cropped_frame, torso_center_cropped)
+                cv2.imshow('Autofollow', cropped)
 
-                cv2.imshow('Autofollow - Live Preview', cropped_frame)
-
-            # Check for quit
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-            # Check max frames
+            frame_num += 1
             if max_frames and frame_num >= max_frames:
                 break
 
-            frame_num += 1
-
-        print(f"Processed {self.frame_count} frames")
-        return {'total_frames': self.frame_count}
+        print(f"Processed {self._frame_count} frames")
+        return {'total_frames': self._frame_count}
 
     def cleanup(self):
-        """Clean up resources."""
-        if self.cap:
-            self.cap.release()
-        if self.out:
-            self.out.release()
+        if self._cap:
+            self._cap.release()
+        if self._out:
+            self._out.release()
         cv2.destroyAllWindows()
-        self.pose_detector.release()
 
     def __enter__(self):
-        """Context manager entry."""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
+    def __exit__(self, *_):
         self.cleanup()
