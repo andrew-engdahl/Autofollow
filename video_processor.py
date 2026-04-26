@@ -1,178 +1,146 @@
-"""Main video processing pipeline."""
+"""Headless video processor — usable standalone (CLI) or embedded in VideoThread."""
 
 import cv2
 import numpy as np
+from config import (
+    OUTPUT_WIDTH, OUTPUT_HEIGHT, DETECTION_INTERVAL, SHOW_OVERLAY,
+)
 from pose_detector import PoseDetector
+from tracker import PersonTracker
 from framing_engine import FramingEngine
-from smoothing import ExponentialSmoother
-from config import DETECTION_INTERVAL, OUTPUT_WIDTH, OUTPUT_HEIGHT, SHOW_OVERLAY
+from smoothing import PTZSmoother
+import config
 
 
 class VideoProcessor:
-    """Main video processing pipeline combining detection, framing, and smoothing."""
+    """Processes a camera stream and produces cropped output frames.
 
-    def __init__(self, camera_index=0, output_file=None, show_overlay=None):
-        """
-        Initialize the video processor.
+    This class handles the pure processing logic. For the GUI path the
+    VideoThread in control_ui.py drives it; for CLI use, call
+    process_video_stream() directly.
+    """
 
-        Args:
-            camera_index: Camera device index (0 = default camera)
-            output_file: Optional path to save output video
-            show_overlay: Whether to show overlay text (uses config default if None)
-        """
+    def __init__(self, camera_index: int = 0, output_file: str | None = None,
+                 show_overlay: bool | None = None):
         self.camera_index = camera_index
         self.output_file = output_file
         self.show_overlay = show_overlay if show_overlay is not None else SHOW_OVERLAY
-        
-        # Initialize components
-        self.pose_detector = PoseDetector()
-        self.framing_engine = None
-        self.smoother = ExponentialSmoother()
-        
-        # Video capture
-        self.cap = None
-        self.out = None
-        self.frame_count = 0
-        
+
+        self._detector = PoseDetector()
+        self._tracker = PersonTracker()
+        self._framing: FramingEngine | None = None
+        self._smoother = PTZSmoother()
+
+        self._cap = None
+        self._out = None
+        self._frame_count = 0
+        self.input_width: int | None = None
+        self.input_height: int | None = None
+
     def initialize_camera(self):
-        """Initialize camera capture."""
-        self.cap = cv2.VideoCapture(self.camera_index)
-        
-        if not self.cap.isOpened():
+        """Open camera and prepare output writer."""
+        self._cap = cv2.VideoCapture(self.camera_index)
+        if not self._cap.isOpened():
             raise RuntimeError(f"Failed to open camera device {self.camera_index}")
-        
-        # Get video properties
-        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
-        
-        if fps == 0:  # Default FPS if not reported
-            fps = 30
-            
-        print(f"Camera initialized: {width}x{height} @ {fps:.1f}fps")
-        
-        # Initialize framing engine with actual input dimensions
-        self.framing_engine = FramingEngine(width, height)
-        
-        # Initialize video writer if output file specified
+
+        w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = self._cap.get(cv2.CAP_PROP_FPS) or 30
+
+        self.input_width = w
+        self.input_height = h
+        self._framing = FramingEngine(w, h)
+
+        print(f"Camera: {w}×{h} @ {fps:.1f} fps")
+
         if self.output_file:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.out = cv2.VideoWriter(self.output_file, fourcc, fps, 
-                                      (OUTPUT_WIDTH, OUTPUT_HEIGHT))
-            if not self.out.isOpened():
-                print(f"Warning: Could not open video writer for {self.output_file}")
-                self.out = None
+            self._out = cv2.VideoWriter(self.output_file, fourcc, fps,
+                                        (OUTPUT_WIDTH, OUTPUT_HEIGHT))
 
-        return width, height, fps
+        return w, h, fps
 
-    def process_frame(self, frame):
+    def process_frame(self, frame: np.ndarray) -> dict:
+        """Run the full pipeline on a single frame.
+
+        Returns a dict with 'frame' (cropped output), 'persons', 'active_id'.
         """
-        Process a single frame through the pipeline.
-
-        Args:
-            frame: Input video frame
-
-        Returns:
-            dict: Processed output and metadata
-        """
-        # Run pose detection every N frames
-        if self.frame_count % DETECTION_INTERVAL == 0:
-            detection = self.pose_detector.detect(frame)
+        if self._frame_count % DETECTION_INTERVAL == 0:
+            detections = self._detector.detect(frame)
         else:
-            detection = {'detected': False, 'bbox': None}
+            detections = []
 
-        # Calculate optimal crop box
-        crop_box = self.framing_engine.calculate_crop_box(detection)
+        persons = self._tracker.update(detections, frame.shape)
 
-        # Apply smoothing to crop parameters
-        smoothed_x, smoothed_y, smoothed_zoom = self.smoother.smooth(
-            crop_box['x'], crop_box['y'], crop_box['zoom']
-        )
+        mode = config.TRACKING_MODE
+        if mode == 'primary' or not persons:
+            output_frame, active_id = self._render_primary(frame, persons)
+        else:
+            output_frame, active_id = self._render_primary(frame, persons)
 
-        # Update crop box with smoothed values
-        crop_box['x'] = smoothed_x
-        crop_box['y'] = smoothed_y
-        crop_box['zoom'] = smoothed_zoom
+        if self.show_overlay:
+            n = len(persons)
+            cv2.putText(output_frame,
+                        f"Frame {self._frame_count} | {n} person(s) | {active_id}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        # Apply crop and resize
-        cropped_frame = self.framing_engine.apply_crop(frame, crop_box)
+        self._frame_count += 1
+        return {'frame': output_frame, 'persons': persons, 'active_id': active_id}
 
-        # Prepare output info
-        output = {
-            'frame': cropped_frame,
-            'detection': detection,
-            'crop_box': crop_box,
-            'frame_num': self.frame_count
-        }
+    def _render_primary(self, frame, persons):
+        if not persons:
+            tx, ty, tz = self._framing._default_target()
+            sx, sy, sz = self._smoother.update('primary', tx, ty, tz)
+        else:
+            primary = persons[0]
+            tx, ty, tz = self._framing.calculate_target(primary)
+            cx = (primary.bbox[0] + primary.bbox[2]) / 2.0
+            cw = OUTPUT_WIDTH / tz
+            sx, sy, sz = self._smoother.update(
+                'primary', tx, ty, tz, person_center_x=cx, crop_width=cw
+            )
+        return self._framing.apply_crop(frame, sx, sy, sz), \
+               persons[0].id if persons else 'none'
 
-        self.frame_count += 1
-        return output
-
-    def process_video_stream(self, max_frames=None, show_preview=True):
-        """
-        Process video stream from camera.
-
-        Args:
-            max_frames: Maximum frames to process (None = continuous)
-            show_preview: Whether to display preview window
-
-        Returns:
-            stats: Processing statistics
-        """
-        print("Starting video processing... Press 'q' to quit")
-        
+    def process_video_stream(self, max_frames: int | None = None,
+                             show_preview: bool = True) -> dict:
+        """CLI entry point: run the capture loop until 'q' or max_frames."""
+        print("Starting… press 'q' to quit")
         frame_num = 0
+
         while True:
-            ret, frame = self.cap.read()
+            ret, frame = self._cap.read()
             if not ret:
-                print("Failed to read frame")
                 break
 
-            # Process frame
             result = self.process_frame(frame)
-            cropped_frame = result['frame']
+            cropped = result['frame']
 
-            # Write to output file
-            if self.out:
-                self.out.write(cropped_frame)
+            if self._out:
+                self._out.write(cropped)
 
-            # Display preview
             if show_preview:
-                # Add frame info if overlay is enabled
-                if self.show_overlay:
-                    info_text = f"Frame: {result['frame_num']} | " \
-                               f"Detected: {'Yes' if result['detection']['detected'] else 'No'}"
-                    cv2.putText(cropped_frame, info_text, (10, 30),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.imshow('Autofollow', cropped)
 
-                cv2.imshow('Autofollow - Live Preview', cropped_frame)
-
-            # Check for quit
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-            # Check max frames
+            frame_num += 1
             if max_frames and frame_num >= max_frames:
                 break
 
-            frame_num += 1
-
-        print(f"Processed {self.frame_count} frames")
-        return {'total_frames': self.frame_count}
+        print(f"Processed {self._frame_count} frames")
+        return {'total_frames': self._frame_count}
 
     def cleanup(self):
-        """Clean up resources."""
-        if self.cap:
-            self.cap.release()
-        if self.out:
-            self.out.release()
+        if self._cap:
+            self._cap.release()
+        if self._out:
+            self._out.release()
         cv2.destroyAllWindows()
-        self.pose_detector.release()
 
     def __enter__(self):
-        """Context manager entry."""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
+    def __exit__(self, *_):
         self.cleanup()

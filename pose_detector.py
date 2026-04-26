@@ -1,151 +1,139 @@
-"""Pose detection using YOLOv8 Pose Detection."""
+"""Pose detection using YOLOv8 — returns all detected persons."""
 
 import cv2
 import numpy as np
-from config import CONFIDENCE_THRESHOLD
+from config import CONFIDENCE_THRESHOLD, YOLO_MODEL, DETECTION_SCALE
 
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
 except ImportError:
     YOLO_AVAILABLE = False
-    print("Warning: YOLOv8 not available, some functionality will be limited")
+    print("Warning: YOLOv8 not available. Install with: pip install ultralytics")
+
+
+def _best_device():
+    """Pick the fastest available compute device."""
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            return 'mps'
+        if torch.cuda.is_available():
+            return 'cuda'
+    except Exception:
+        pass
+    return 'cpu'
 
 
 class PoseDetector:
-    """Detects human pose in video frames using YOLOv8 Pose."""
+    """Detects human poses in video frames using YOLOv8 Pose.
+
+    Returns all detected persons as a list of dicts, not just the first.
+    """
 
     def __init__(self):
-        """Initialize the YOLOv8 Pose detector."""
         if not YOLO_AVAILABLE:
             raise ImportError("YOLOv8 is required. Install with: pip install ultralytics")
-        
-        # Load YOLOv8 Pose model (auto-downloads if needed)
-        print("Loading YOLOv8 Pose model (this may take a moment on first run)...")
-        self.model = YOLO('yolov8n-pose.pt')  # nano model for speed
-        self.model.to('cpu')  # Use CPU (or 'cuda' for GPU if available)
+
+        print(f"Loading {YOLO_MODEL}...")
+        self.model = YOLO(YOLO_MODEL)
+        device = _best_device()
+        self.model.to(device)
+        print(f"Using device: {device}")
         self.conf_threshold = CONFIDENCE_THRESHOLD
 
     def detect(self, frame):
-        """
-        Detect pose landmarks in a frame for all people.
+        """Detect all persons in a frame.
 
         Args:
-            frame: Input video frame (BGR format from OpenCV)
+            frame: BGR frame from OpenCV.
 
         Returns:
-            dict: Contains 'landmarks', 'bboxes', 'detected', and 'num_people' keys
+            list[dict]: One dict per detected person:
+                {
+                    'bbox': (x_min, y_min, x_max, y_max),  # pixel coords in original frame
+                    'keypoints': np.array,                   # shape (17, 4) — [x_norm, y_norm, 0, conf]
+                    'confidence': float,
+                }
+            Empty list if no persons detected.
         """
-        h, w, c = frame.shape
-        
-        # Run YOLO Pose detection
-        results = self.model(frame, conf=self.conf_threshold, verbose=False)
-        
-        output = {
-            'detected': False,
-            'landmarks': None,
-            'bbox': None,  # Keep for backward compatibility (first person)
-            'bboxes': [],  # List of all bboxes
-            'num_people': 0,
-            'keypoints': None
-        }
-        
-        if len(results) > 0 and results[0].keypoints is not None:
-            keypoints = results[0].keypoints
-            
-            if keypoints.data is not None and len(keypoints.data) > 0:
-                num_people = len(keypoints.data)
-                output['num_people'] = num_people
-                output['detected'] = True
-                
-                all_bboxes = []
-                
-                # Process all detected people
-                for person_idx in range(num_people):
-                    kpts = keypoints.data[person_idx]  # Keypoints for this person
-                    
-                    # Calculate bounding box from visible keypoints
-                    x_coords = []
-                    y_coords = []
-                    
-                    for idx, (x, y, conf) in enumerate(kpts):
-                        if conf > CONFIDENCE_THRESHOLD:
-                            x_coords.append(x.item())
-                            y_coords.append(y.item())
-                    
-                    if x_coords and y_coords:
-                        x_min, x_max = int(min(x_coords)), int(max(x_coords))
-                        y_min, y_max = int(min(y_coords)), int(max(y_coords))
-                        
-                        # Ensure bbox is within frame
-                        x_min = max(0, x_min)
-                        y_min = max(0, y_min)
-                        x_max = min(w, x_max)
-                        y_max = min(h, y_max)
-                        
-                        all_bboxes.append((x_min, y_min, x_max, y_max))
-                
-                output['bboxes'] = all_bboxes
-                
-                # Keep first person bbox for backward compatibility
-                if all_bboxes:
-                    output['bbox'] = all_bboxes[0]
-                    
-                    # Store landmarks for first person (backward compatibility)
-                    kpts = keypoints.data[0]
-                    landmarks = []
-                    for kpt in kpts:
-                        x, y, conf = kpt[0].item(), kpt[1].item(), kpt[2].item()
-                        landmarks.append([x / w, y / h, 0, conf])
-                    
-                    output['landmarks'] = np.array(landmarks)
-                    output['keypoints'] = output['landmarks']
-        
-        return output
+        h, w = frame.shape[:2]
 
-    def draw_pose(self, frame, detection_result):
-        """
-        Draw pose landmarks and skeleton on the frame.
+        # Optionally downscale frame for faster inference
+        if DETECTION_SCALE < 1.0:
+            det_w = max(1, int(w * DETECTION_SCALE))
+            det_h = max(1, int(h * DETECTION_SCALE))
+            det_frame = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            det_frame = frame
+            det_w, det_h = w, h
 
-        Args:
-            frame: Input video frame
-            detection_result: Output from detect() method
+        results = self.model(det_frame, conf=self.conf_threshold, verbose=False)
 
-        Returns:
-            frame: Frame with pose drawn
-        """
-        if detection_result['detected'] and detection_result['landmarks'] is not None:
-            h, w, c = frame.shape
-            landmarks = detection_result['landmarks']
-            
-            # Convert normalized landmarks to pixel coordinates
-            keypoints = landmarks[:, :2]
-            keypoints[:, 0] *= w
-            keypoints[:, 1] *= h
-            
-            # Draw circles for each keypoint
-            for idx, (x, y) in enumerate(keypoints):
-                confidence = landmarks[idx, 3]
-                if confidence > CONFIDENCE_THRESHOLD:
-                    cv2.circle(frame, (int(x), int(y)), 4, (0, 255, 0), -1)
-            
-            # Draw all bounding boxes
-            num_people = detection_result.get('num_people', 1)
-            bboxes = detection_result.get('bboxes', [])
-            
-            if num_people > 1 and bboxes:
-                # Multiple people - draw all with different colors
-                colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255)]
-                for idx, (x_min, y_min, x_max, y_max) in enumerate(bboxes):
-                    color = colors[idx % len(colors)]
-                    cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), color, 2)
-            elif detection_result['bbox']:
-                # Single person
-                x_min, y_min, x_max, y_max = detection_result['bbox']
-                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
+        persons = []
+        if not results or results[0].keypoints is None:
+            return persons
 
-        return frame
+        kpts_data = results[0].keypoints.data    # shape: (N, 17, 3) — x, y, conf in det_frame coords
+        boxes_data = results[0].boxes             # detection boxes
+
+        scale_x = w / det_w
+        scale_y = h / det_h
+
+        for i, kpts in enumerate(kpts_data):
+            # Build keypoints array normalized to original frame
+            landmarks = []
+            x_coords, y_coords = [], []
+
+            for kpt in kpts:
+                kx, ky, kconf = kpt[0].item(), kpt[1].item(), kpt[2].item()
+                # Scale back to original frame coords
+                px, py = kx * scale_x, ky * scale_y
+                landmarks.append([px / w, py / h, 0.0, kconf])
+                if kconf > self.conf_threshold:
+                    x_coords.append(px)
+                    y_coords.append(py)
+
+            if not x_coords:
+                continue
+
+            # Reject poses where any visible keypoint lies outside the input frame.
+            # This filters people whose body extends beyond the camera's field of view —
+            # their partially-clipped poses would produce unreliable framing targets.
+            if (min(x_coords) < 0 or min(y_coords) < 0
+                    or max(x_coords) > w or max(y_coords) > h):
+                continue
+
+            # Require at least one hip keypoint (COCO indices 11=left_hip, 12=right_hip).
+            # This filters foreground audience members whose body is cut off at the waist —
+            # they appear as large, high-confidence face detections with no lower body.
+            _HIP_INDICES = [11, 12]
+            has_hips = any(
+                landmarks[idx][3] > self.conf_threshold
+                for idx in _HIP_INDICES
+                if idx < len(landmarks)
+            )
+            if not has_hips:
+                continue
+
+            x_min = int(min(x_coords))
+            y_min = int(min(y_coords))
+            x_max = int(max(x_coords))
+            y_max = int(max(y_coords))
+
+            # Person confidence: use box confidence when available, else mean keypoint conf
+            if boxes_data is not None and i < len(boxes_data):
+                conf = float(boxes_data.conf[i])
+            else:
+                conf = float(np.mean([lm[3] for lm in landmarks]))
+
+            persons.append({
+                'bbox': (x_min, y_min, x_max, y_max),
+                'keypoints': np.array(landmarks, dtype=np.float32),
+                'confidence': conf,
+            })
+
+        return persons
 
     def release(self):
-        """Clean up resources."""
         pass  # YOLO handles cleanup automatically

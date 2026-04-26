@@ -1,109 +1,115 @@
 #!/usr/bin/env python3
 """
-Autofollow: Intelligent video framing using pose detection.
+Autofollow — intelligent virtual PTZ camera using pose detection.
 
-A macOS app that captures video from a camera device, detects the person using pose estimation,
-and automatically crops the video to a 16:9 shot with smooth camera movements.
+GUI mode (default):
+    python main.py
 
-Usage:
-    python main.py                                      # Live preview from default camera
-    python main.py --camera 0                           # Specify camera device
-    python main.py --output output.mp4                  # Save output to file
-    python main.py --shot-type full_body                # Full body shot (other options: waist_up, medium, close_up)
-    python main.py --max-zoom 3.0                       # Set maximum zoom factor
-    python main.py --no-overlay                         # Hide overlay text
-    python main.py --help                               # Show help
+CLI / headless mode:
+    python main.py --headless --output output.mp4 --camera 1
+
+List cameras:
+    python main.py --list-cameras
 """
 
 import argparse
 import sys
-import config
-from video_processor import VideoProcessor
 
 
-def find_available_cameras(max_cameras=4):
-    """Find available camera devices."""
+def list_cameras():
     import cv2
-    available = []
-    for i in range(max_cameras):
+    cameras = []
+    for i in range(8):
         cap = cv2.VideoCapture(i)
         if cap.isOpened():
-            available.append(i)
+            cameras.append(i)
             cap.release()
-    return available
+    if cameras:
+        print(f"Available cameras: {cameras}")
+    else:
+        print("No cameras found")
+
+
+def run_gui():
+    from PyQt5.QtWidgets import QApplication
+    from control_ui import ControlWindow
+    app = QApplication(sys.argv)
+    app.setApplicationName("Autofollow")
+    window = ControlWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+
+def run_headless(args):
+    """Fallback CLI mode — no GUI, just OpenCV preview window."""
+    import config
+
+    if args.camera is not None:
+        config.CAMERA_INDEX = args.camera
+    if args.shot_type:
+        config.SHOT_TYPE = args.shot_type
+    if args.max_zoom is not None:
+        config.MAX_ZOOM = args.max_zoom
+    if args.deadzone is not None:
+        if not 0 <= args.deadzone <= 1:
+            print("Error: deadzone must be between 0 and 1", file=sys.stderr)
+            sys.exit(1)
+        config.DEADZONE = args.deadzone
+
+    from video_processor import VideoProcessor
+    processor = VideoProcessor(
+        camera_index=config.CAMERA_INDEX,
+        output_file=args.output,
+    )
+    try:
+        processor.initialize_camera()
+        processor.process_video_stream(
+            max_frames=args.max_frames,
+            show_preview=not args.no_preview,
+        )
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nInterrupted")
+    finally:
+        processor.cleanup()
 
 
 def main():
-    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Autofollow: Intelligent video framing using pose detection'
+        description="Autofollow — intelligent virtual PTZ camera"
     )
-    parser.add_argument('--camera', type=int, default=0,
-                       help='Camera device index (default: 0)')
     parser.add_argument('--list-cameras', action='store_true',
-                       help='List available camera devices')
+                        help='List available camera devices and exit')
+    parser.add_argument('--headless', action='store_true',
+                        help='Run without GUI (OpenCV preview only)')
+    parser.add_argument('--camera', type=int, default=None,
+                        help='Camera device index (headless mode)')
     parser.add_argument('--output', type=str, default=None,
-                       help='Output video file path (e.g., output.mp4)')
+                        help='Output video file path (headless mode)')
     parser.add_argument('--max-frames', type=int, default=None,
-                       help='Maximum frames to process')
+                        help='Maximum frames to process (headless mode)')
     parser.add_argument('--shot-type', type=str, default=None,
-                       choices=['full_body', 'waist_up', 'medium', 'close_up'],
-                       help='Type of shot to frame (default: config value)')
+                        choices=['full_body', 'waist_up', 'medium', 'close_up'],
+                        help='Shot type (headless mode)')
     parser.add_argument('--max-zoom', type=float, default=None,
-                       help='Maximum zoom factor (default: config value)')
+                        help='Maximum zoom factor (headless mode)')
+    parser.add_argument('--deadzone', type=float, default=None,
+                        help='Horizontal deadzone 0–1 (headless mode)')
     parser.add_argument('--no-preview', action='store_true',
-                       help='Disable preview window')
-    parser.add_argument('--no-overlay', action='store_true',
-                       help='Disable overlay text on preview')
+                        help='Disable preview window (headless mode)')
 
     args = parser.parse_args()
 
-    # Override config with command-line arguments if provided
-    if args.shot_type:
-        config.SHOT_TYPE = args.shot_type
-    
-    if args.max_zoom:
-        config.MAX_ZOOM = args.max_zoom
-
-    # List available cameras
     if args.list_cameras:
-        cameras = find_available_cameras()
-        if cameras:
-            print(f"Available cameras: {cameras}")
-        else:
-            print("No cameras found")
+        list_cameras()
         return
 
-    # Initialize processor
-    processor = None
-    try:
-        # Determine overlay setting: --no-overlay flag overrides config, otherwise use config default
-        show_overlay_setting = False if args.no_overlay else None  # None will use config default
-        processor = VideoProcessor(camera_index=args.camera, output_file=args.output,
-                                   show_overlay=show_overlay_setting)
-        processor.initialize_camera()
-
-        # Process video
-        stats = processor.process_video_stream(
-            max_frames=args.max_frames,
-            show_preview=not args.no_preview
-        )
-
-        print(f"\nProcessing complete!")
-        print(f"Total frames processed: {stats['total_frames']}")
-        if args.output:
-            print(f"Output saved to: {args.output}")
-
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        cameras = find_available_cameras()
-        print(f"Available cameras: {cameras}", file=sys.stderr)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    finally:
-        if processor:
-            processor.cleanup()
+    if args.headless:
+        run_headless(args)
+    else:
+        run_gui()
 
 
 if __name__ == '__main__':
