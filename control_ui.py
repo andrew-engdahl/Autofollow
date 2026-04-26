@@ -255,15 +255,7 @@ class VideoThread(QThread):
         """
         h, w = frame.shape[:2]
 
-        # Draw all tracking circles on a copy, then alpha-blend once
-        circle_layer = frame.copy()
-        for person in persons:
-            cx = int((person.bbox[0] + person.bbox[2]) / 2)
-            cy = int((person.bbox[1] + person.bbox[3]) / 2)
-            radius = max(15, int((person.bbox[2] - person.bbox[0]) * 0.18))
-            color = (0, 255, 0) if person.id == primary_id else (0, 0, 255)
-            cv2.circle(circle_layer, (cx, cy), radius, color, -1)
-        out = cv2.addWeighted(circle_layer, 0.35, frame, 0.65, 0)
+        out = frame.copy()
 
         # Draw skeleton and keypoint dots (fully opaque) on top
         for person in persons:
@@ -278,8 +270,6 @@ class VideoThread(QThread):
             for a, b in _SKELETON:
                 if a in pts and b in pts:
                     cv2.line(out, pts[a], pts[b], skel_color, 2)
-            for pt in pts.values():
-                cv2.circle(out, pt, 4, skel_color, -1)
 
         return out
 
