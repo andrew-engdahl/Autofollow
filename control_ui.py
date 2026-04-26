@@ -772,6 +772,19 @@ class ControlWindow(QMainWindow):
         box = QGroupBox("Output")
         layout = QVBoxLayout(box)
 
+        display_row = QHBoxLayout()
+        display_row.addWidget(QLabel("Display:"))
+        self._display_combo = QComboBox()
+        screens = QApplication.screens()
+        for i, screen in enumerate(screens):
+            geo = screen.geometry()
+            self._display_combo.addItem(
+                f"Display {i + 1}  ({geo.width()}×{geo.height()})", i
+            )
+        display_row.addWidget(self._display_combo)
+        display_row.addStretch()
+        layout.addLayout(display_row)
+
         btn_row = QHBoxLayout()
         btn_fullscreen = QPushButton("Open Fullscreen Output")
         btn_fullscreen.clicked.connect(self._open_fullscreen)
@@ -892,6 +905,11 @@ class ControlWindow(QMainWindow):
             self._state.show_diagnostics = bool(state)
 
     def _open_fullscreen(self):
+        screen_index = self._display_combo.currentData()
+        screens = QApplication.screens()
+        if 0 <= screen_index < len(screens):
+            geo = screens[screen_index].geometry()
+            self._output_win.setGeometry(geo)
         self._output_win.showFullScreen()
         self._output_win.raise_()
 

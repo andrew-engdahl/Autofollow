@@ -16,12 +16,12 @@ A macOS application that intelligently crops video from a camera device using AI
 ## Requirements
 
 - macOS 10.14+
-- Python 3.8+
+- Python 3.10+
 - Webcam or video capture device
 
 ## Installation
 
-### 1. Install Python 3.8+
+### 1. Install Python 3.10+
 
 If you don't have Python installed, download from [python.org](https://www.python.org/downloads/)
 
