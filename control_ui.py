@@ -76,6 +76,7 @@ class AppState:
         self.manual_switch_id: str | None = None         # set by UI, consumed by video thread
         self.camera_change_requested: bool = False
         self.show_diagnostics: bool = config.SHOW_DIAGNOSTICS
+        self.auto_follow_enabled: bool = True
 
     def read(self):
         """Return a snapshot of current settings (thread-safe)."""
@@ -91,6 +92,7 @@ class AppState:
                 'manual_switch_id': self.manual_switch_id,
                 'camera_change_requested': self.camera_change_requested,
                 'show_diagnostics': self.show_diagnostics,
+                'auto_follow_enabled': self.auto_follow_enabled,
             }
 
     def consume_manual_switch(self) -> str | None:
@@ -231,6 +233,15 @@ class VideoThread(QThread):
         mode = settings['tracking_mode']
         shot_type = settings['shot_type']
         diagnostics = settings.get('show_diagnostics', False)
+
+        if not settings.get('auto_follow_enabled', True):
+            tx, ty, tz = self._framing._default_target()
+            sx, sy, sz = self._smoother.update('__passthrough__', tx, ty, tz)
+            output_frame = self._framing.apply_crop(frame, sx, sy, sz)
+            active_id = 'disabled'
+            elapsed = time.monotonic() - t0
+            fps = 1.0 / elapsed if elapsed > 0 else 0.0
+            return _bgr_to_qimage(output_frame), {'fps': fps, 'n_persons': len(persons), 'active_id': active_id}
 
         if mode == 'primary' or not persons:
             output_frame = self._render_primary(frame, persons, shot_type, diagnostics, settings)
@@ -698,14 +709,16 @@ class ControlWindow(QMainWindow):
         trig_label = QLabel("Mode:")
         self._trig_group = QButtonGroup()
         triggers = [
+            ("Disabled",      "disabled"),
             ("Primary Focus", "primary"),
             ("Time",          "time"),
             ("Activity",      "activity"),
             ("Manual",        "manual"),
         ]
-        # Determine initial checked state: 'primary' maps to tracking_mode, others to switch_trigger
+        # Determine initial checked state
         current_trigger = (
-            "primary" if self._state.tracking_mode == 'primary'
+            "disabled" if not self._state.auto_follow_enabled
+            else "primary" if self._state.tracking_mode == 'primary'
             else self._state.switch_trigger
         )
         for label, key in triggers:
@@ -864,21 +877,23 @@ class ControlWindow(QMainWindow):
 
     def _on_trigger_changed(self, button):
         key = button.property("trigger_key")
-        if key == 'primary':
-            with QMutexLocker(self._state._lock):
+        with QMutexLocker(self._state._lock):
+            if key == 'disabled':
+                self._state.auto_follow_enabled = False
+            elif key == 'primary':
+                self._state.auto_follow_enabled = True
                 self._state.tracking_mode = 'primary'
-        else:
-            with QMutexLocker(self._state._lock):
+            else:
+                self._state.auto_follow_enabled = True
                 self._state.tracking_mode = 'switcher'
                 self._state.switch_trigger = key
         self._update_trigger_ui(key)
 
     def _update_trigger_ui(self, trigger_key: str):
-        """Show/hide interval row based on selected trigger."""
+        """Show/hide controls based on selected trigger."""
         show_interval = trigger_key == 'time'
         self._interval_label.setVisible(show_interval)
         self._interval_spin.setVisible(show_interval)
-        # Manual person buttons are only meaningful in manual switcher mode
         manual_active = trigger_key == 'manual'
         for btn in self._person_buttons.values():
             btn.setVisible(manual_active)
