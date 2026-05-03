@@ -16,14 +16,16 @@ _ACTIVITY_DY_WEIGHT = 1.0   # vertical displacement weight
 _CENTER_DIST_FALLBACK = 0.15   # fraction of frame diagonal (~0.15 = generous for fast movers)
 
 
+_FG_SCORE_EMA_ALPHA = 0.15   # heavy smoothing on bbox-area score to prevent fg_ratio oscillation
+
 @dataclass
 class TrackedPerson:
     id: str                          # 'person1', 'person2', …
     bbox: tuple                      # (x_min, y_min, x_max, y_max) in pixel coords
     keypoints: np.ndarray            # (17, 4) — [x_norm, y_norm, 0, conf]
     confidence: float
-    foreground_score: float = 0.0    # bbox_area / frame_area — larger = closer
-    activity_score: float = 0.0      # bbox-center displacement since last frame
+    foreground_score: float = 0.0    # EMA-smoothed bbox_area / frame_area — larger = closer
+    activity_score: float = 0.0      # EMA-smoothed weighted center displacement
     frames_unseen: int = 0
 
 
@@ -138,7 +140,9 @@ class PersonTracker:
                 )
                 track.keypoints = det['keypoints']
                 track.confidence = det['confidence']
-                track.foreground_score = _area(track.bbox) / self._frame_area
+                raw_fg = _area(track.bbox) / self._frame_area
+                track.foreground_score = (_FG_SCORE_EMA_ALPHA * raw_fg
+                                          + (1.0 - _FG_SCORE_EMA_ALPHA) * track.foreground_score)
                 track.activity_score = activity
                 track.frames_unseen = 0
                 matched_ids.add(best_id)

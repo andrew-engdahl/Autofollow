@@ -10,33 +10,37 @@ Z (zoom)  – secondary; same treatment as tilt, even slower, so zoom changes
              are nearly imperceptible moment-to-moment.
 """
 
-from config import SMOOTHING, MAX_PAN_SPEED, MAX_TILT_SPEED, MAX_ZOOM_SPEED, DEADZONE
+import config
 
 # ── Baseline lerp rates ──────────────────────────────────────────────────────
-# SMOOTHING=0 → _PAN_BASE_ALPHA   (already substantial smoothing)
+# SMOOTHING=0 → _PAN_BASE_ALPHA   (gentle, responsive)
 # SMOOTHING=1 → _PAN_MIN_ALPHA    (very slow, noticeably delayed)
-_PAN_BASE_ALPHA = 0.18   # factor at SMOOTHING=0
-_PAN_MIN_ALPHA  = 0.04   # factor at SMOOTHING=1
+_PAN_BASE_ALPHA = 0.08   # factor at SMOOTHING=0 — slower baseline to reduce jitter
+_PAN_MIN_ALPHA  = 0.02   # factor at SMOOTHING=1
 
 # Tilt and zoom are always heavily dampened, independent of the user dial.
-# These are fractions of the pan alpha so they remain proportionally slower.
-_TILT_ALPHA_SCALE = 0.25  # tilt lerp = pan_alpha * this
-_ZOOM_ALPHA_SCALE = 0.15  # zoom lerp = pan_alpha * this
+_TILT_ALPHA_SCALE = 0.20  # tilt lerp = pan_alpha * this
+_ZOOM_ALPHA_SCALE = 0.10  # zoom lerp = pan_alpha * this
 
-# Quadratic ramp for pan: factor grows from pan_alpha (near target) up to
-# _PAN_QUAD_MAX (far from target), creating a natural ease-out.
-_PAN_QUAD_MAX = 0.55
-_REF_PAN_DISTANCE = 200.0   # pixels — normalises the quadratic ramp
+# Quadratic ramp: camera accelerates when subject is far from target.
+# Kept modest so fast moves don't look like a whip pan.
+_PAN_QUAD_MAX = 0.30
+_REF_PAN_DISTANCE = 300.0   # pixels — distance at which quad factor reaches _PAN_QUAD_MAX
+
+# Hard speed caps — pixels (or zoom units) per frame.
+# These are the absolute ceiling regardless of the lerp calculation.
+_MAX_PAN_SPEED  = 15    # px/frame  (~450px/s at 30fps — smooth but responsive)
+_MAX_TILT_SPEED = 3     # px/frame
+_MAX_ZOOM_SPEED = 0.015 # zoom units/frame
 
 
 def _pan_alpha() -> float:
-    """Map the 0-1 SMOOTHING dial to a baseline pan lerp factor (inverted scale)."""
-    t = max(0.0, min(1.0, SMOOTHING))
+    """Map the 0-1 SMOOTHING dial to a pan lerp factor (read from config each call)."""
+    t = max(0.0, min(1.0, config.SMOOTHING))
     return _PAN_BASE_ALPHA + (_PAN_MIN_ALPHA - _PAN_BASE_ALPHA) * t
 
 
 def _lerp_step(current: float, target: float, alpha: float, max_speed: float) -> float:
-    """Simple lerp step capped at max_speed."""
     error = target - current
     if error == 0.0:
         return current
@@ -45,8 +49,8 @@ def _lerp_step(current: float, target: float, alpha: float, max_speed: float) ->
     return current + movement
 
 
-def _pan_step(current: float, target: float, max_speed: float) -> float:
-    """Quadratic ease-out pan step: fast when far, slow when close."""
+def _pan_step(current: float, target: float) -> float:
+    """Quadratic ease-out pan: accelerates when far, gentle when close."""
     error = target - current
     if error == 0.0:
         return current
@@ -54,7 +58,7 @@ def _pan_step(current: float, target: float, max_speed: float) -> float:
     normalized = min(1.0, abs(error) / _REF_PAN_DISTANCE)
     factor = base + (_PAN_QUAD_MAX - base) * normalized ** 2
     movement = factor * error
-    movement = max(-max_speed, min(max_speed, movement))
+    movement = max(-_MAX_PAN_SPEED, min(_MAX_PAN_SPEED, movement))
     return current + movement
 
 
@@ -90,15 +94,15 @@ class PTZSmoother:
             effective_target_x = self._apply_deadzone(
                 curr_x, target_x, person_center_x, crop_width
             )
-        new_x = _pan_step(curr_x, effective_target_x, MAX_PAN_SPEED)
+        new_x = _pan_step(curr_x, effective_target_x)
 
-        # ── Y (tilt): slow lerp — barely moves ──────────────────────────────
+        # ── Y (tilt): slow lerp ──────────────────────────────────────────────
         tilt_alpha = _pan_alpha() * _TILT_ALPHA_SCALE
-        new_y = _lerp_step(curr_y, target_y, tilt_alpha, MAX_TILT_SPEED)
+        new_y = _lerp_step(curr_y, target_y, tilt_alpha, _MAX_TILT_SPEED)
 
-        # ── Z (zoom): even slower lerp — nearly static ──────────────────────
+        # ── Z (zoom): even slower lerp ───────────────────────────────────────
         zoom_alpha = _pan_alpha() * _ZOOM_ALPHA_SCALE
-        new_zoom = _lerp_step(curr_zoom, target_zoom, zoom_alpha, MAX_ZOOM_SPEED)
+        new_zoom = _lerp_step(curr_zoom, target_zoom, zoom_alpha, _MAX_ZOOM_SPEED)
 
         state['x'], state['y'], state['zoom'] = new_x, new_y, new_zoom
         return new_x, new_y, new_zoom
@@ -115,15 +119,10 @@ class PTZSmoother:
     @staticmethod
     def _apply_deadzone(current_x: float, target_x: float,
                         person_center_x: float, crop_width: float) -> float:
-        """Return an effective target_x based on how far the subject is from center.
-
-        Inner zone (50% of deadzone radius) → hold position.
-        Transition band                     → quadratic ramp 0→full.
-        Outside deadzone                    → full target_x.
-        """
+        """Hold pan while subject stays within the deadzone; ramp outside it."""
         viewport_center = current_x + crop_width / 2.0
         distance = abs(person_center_x - viewport_center)
-        half_deadzone = (crop_width * DEADZONE) / 2.0
+        half_deadzone = (crop_width * config.DEADZONE) / 2.0
         inner_deadzone = half_deadzone * 0.5
 
         if distance <= inner_deadzone:

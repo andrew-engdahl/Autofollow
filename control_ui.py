@@ -301,13 +301,21 @@ class VideoThread(QThread):
         # Build per-person diagnostics list for the diagnostics panel
         persons_diag = []
         for p in persons:
+            cx = (p.bbox[0] + p.bbox[2]) / 2.0
+            cy = (p.bbox[1] + p.bbox[3]) / 2.0
+            smoother_state = self._smoother.get_state(p.id) or {}
             persons_diag.append({
                 'id': p.id,
                 'fg_score': p.foreground_score,
                 'activity': p.activity_score,
                 'bbox': p.bbox,
+                'center': (cx, cy),
+                'smoother_x': smoother_state.get('x'),
+                'smoother_zoom': smoother_state.get('zoom'),
+                'frames_unseen': p.frames_unseen,
             })
 
+        dwell_elapsed = time.monotonic() - self._primary_last_switch_time
         meta = {
             'fps': fps,
             'n_persons': len(persons),
@@ -316,8 +324,10 @@ class VideoThread(QThread):
             'primary_id': self._primary_id,
             'pending_id': self._primary_pending_id,
             'pretraveling': self._primary_pretraveling,
-            'dwell_elapsed': time.monotonic() - self._primary_last_switch_time,
+            'dwell_elapsed': dwell_elapsed,
+            'dwell_threshold': 3.0,
             'mode': mode,
+            'smoother_primary': self._smoother.get_state('primary'),
         }
         return _bgr_to_qimage(output_frame), meta
 
@@ -507,16 +517,21 @@ class VideoThread(QThread):
 
         # --- Candidate selection: nearest (by fg_score) or significantly more active ---
         # persons[] is sorted foreground_score desc (nearest = persons[0])
+        # fg_ratio thresholds use hysteresis: a higher bar to initiate a switch than
+        # was required to arrive at the current primary, preventing oscillation when two
+        # people have similar sizes.  Both fg_score and activity_score are EMA-smoothed
+        # in the tracker so single-frame noise doesn't trigger a switch.
         nearest = persons[0]
         if nearest.id != self._primary_id and self._primary_pending_id is None:
-            if now - self._primary_last_switch_time >= 1.0:
+            if now - self._primary_last_switch_time >= 3.0:
                 fg_ratio = nearest.foreground_score / max(current_p.foreground_score, 1e-6)
                 cand_act = nearest.activity_score
                 curr_act = current_p.activity_score
-                # Activity switch: candidate must clear a noise floor (5.0 weighted px/frame
-                # after EMA) and be at least 1.5× more active than the current subject.
-                activity_wins = cand_act >= 5.0 and cand_act > curr_act * 1.5
-                if fg_ratio >= 1.15 or activity_wins:
+                # Proximity switch: candidate must be substantially closer (50% more area).
+                fg_wins = fg_ratio >= 1.5
+                # Activity switch: candidate must clear a noise floor AND be 2× more active.
+                activity_wins = cand_act >= 5.0 and cand_act > curr_act * 2.0
+                if fg_wins or activity_wins:
                     self._primary_pending_id = nearest.id
                     self._primary_pretraveling = True
                     self._primary_pretravel_start = now
@@ -711,16 +726,14 @@ class DiagnosticsWindow(QMainWindow):
         # ── Per-person table ─────────────────────────────────────────────
         persons_box = QGroupBox("Tracked Persons")
         persons_layout = QVBoxLayout(persons_box)
-        self._table = QTableWidget(0, 6)
+        self._table = QTableWidget(0, 8)
         self._table.setHorizontalHeaderLabels(
-            ["ID", "FG Score", "Activity", "FG Ratio", "Act Ratio", "BBox"]
+            ["ID", "FG(sm)", "Act(sm)", "FG Ratio", "Act Ratio", "Unseen", "Center X,Y", "Zoom(sm)"]
         )
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionMode(QTableWidget.NoSelection)
-        self._table.setFixedHeight(130)
+        self._table.setFixedHeight(150)
         persons_layout.addWidget(self._table)
         layout.addWidget(persons_box)
 
@@ -785,16 +798,19 @@ class DiagnosticsWindow(QMainWindow):
         curr_fg  = current_p['fg_score'] if current_p else 1e-6
         curr_act = current_p['activity'] if current_p else 1e-6
 
+        dwell_threshold = meta.get('dwell_threshold', 3.0)
+        gate_open = dwell >= dwell_threshold
+
         if self.isVisible():
             self._lbl_mode.setText(mode)
             self._lbl_active.setText(primary_id or '—')
             self._lbl_pending.setText(pending_id or '—')
             self._lbl_phase.setText(phase)
-            self._lbl_dwell.setText(f"{dwell:.2f}s")
+            self._lbl_dwell.setText(f"{dwell:.2f}/{dwell_threshold:.0f}s")
             self._lbl_fps.setText(f"{fps:.1f}")
 
-            # Colour the dwell label red when < 1s (gate not yet open)
-            if dwell < 1.0:
+            # Red = gate closed (can't switch yet), green = gate open
+            if not gate_open:
                 self._lbl_dwell.setStyleSheet("color: #e06c75; font-weight: bold;")
             else:
                 self._lbl_dwell.setStyleSheet("color: #98c379; font-weight: bold;")
@@ -807,18 +823,26 @@ class DiagnosticsWindow(QMainWindow):
                 act       = p['activity']
                 fg_ratio  = fg  / max(curr_fg,  1e-6)
                 act_ratio = act / max(curr_act, 1e-6)
-                x1, y1, x2, y2 = p['bbox']
+                cx, cy    = p.get('center', (0, 0))
+                unseen    = p.get('frames_unseen', 0)
+                sz        = p.get('smoother_zoom')
 
                 is_active  = pid == primary_id
                 is_pending = pid == pending_id
+
+                # Flag cells that would trigger a switch (for easy reading)
+                fg_trigger  = fg_ratio >= 1.5 and gate_open and not is_active
+                act_trigger = act >= 5.0 and act_ratio >= 2.0 and gate_open and not is_active
 
                 cells = [
                     pid,
                     f"{fg:.4f}",
                     f"{act:.2f}",
-                    f"{fg_ratio:.2f}",
-                    f"{act_ratio:.2f}",
-                    f"{x1},{y1}→{x2},{y2}",
+                    f"{'!' if fg_trigger  else ''}{fg_ratio:.2f}",
+                    f"{'!' if act_trigger else ''}{act_ratio:.2f}",
+                    str(unseen),
+                    f"{cx:.0f},{cy:.0f}",
+                    f"{sz:.2f}" if sz is not None else "—",
                 ]
                 for col, text in enumerate(cells):
                     item = QTableWidgetItem(text)
@@ -827,18 +851,25 @@ class DiagnosticsWindow(QMainWindow):
                         item.setBackground(QColor(40, 80, 40))
                     elif is_pending:
                         item.setBackground(QColor(80, 60, 20))
+                    elif fg_trigger or act_trigger:
+                        item.setBackground(QColor(80, 40, 40))
                     self._table.setItem(row, col, item)
 
         # ── Switch event log: append a line when active_id changes ───────
         if active_id != self._last_active_id and active_id not in ('none', 'disabled', None):
             ts = time.strftime("%H:%M:%S")
             reason = ''
-            if persons and current_p:
+            if persons:
                 nearest = persons[0]
-                if nearest['id'] != primary_id:
-                    fg_r  = nearest['fg_score']  / max(curr_fg,  1e-6)
-                    act_r = nearest['activity']  / max(curr_act, 1e-6)
-                    reason = f"  [fg_r={fg_r:.2f} act_r={act_r:.2f}]"
+                fg_r  = nearest['fg_score'] / max(curr_fg,  1e-6)
+                act_r = nearest['activity'] / max(curr_act, 1e-6)
+                # Show which threshold was met (or neither — means forced recovery)
+                why = []
+                if fg_r >= 1.5:
+                    why.append(f"fg={fg_r:.2f}≥1.5")
+                if nearest['activity'] >= 5.0 and act_r >= 2.0:
+                    why.append(f"act={act_r:.2f}≥2.0")
+                reason = f"  [{', '.join(why) if why else 'recovery'}]"
             line = (f"[{ts}]  {self._last_active_id or '—'} → {active_id}"
                     f"  dwell={dwell:.2f}s{reason}")
             self._log.append(line)
