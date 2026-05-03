@@ -6,7 +6,7 @@ OUTPUT_HEIGHT = 720
 OUTPUT_ASPECT_RATIO = 16 / 9
 
 # Pose detection
-CONFIDENCE_THRESHOLD = 0.5
+CONFIDENCE_THRESHOLD = 0.7
 YOLO_MODEL = 'yolov8n-pose.pt'    # nano=n, small=s, medium=m, large=l
 DETECTION_SCALE = 0.5             # Run YOLO on this fraction of input resolution (0.25–1.0)
 DETECTION_INTERVAL = 1            # Run pose detection every N frames (1 = every frame)
