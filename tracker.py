@@ -7,6 +7,9 @@ from config import MAX_PERSONS, FOREGROUND_EXCLUSION_Y as _DEFAULT_EXCLUSION_Y
 _DROPOUT_FRAMES = 10   # drop a track after this many consecutive unmatched frames
 _IOU_THRESHOLD = 0.3   # minimum IoU to match a detection to an existing track
 _BBOX_ALPHA = 0.35     # bbox smoothing: fraction of new detection blended each frame
+_ACTIVITY_EMA_ALPHA = 0.3   # EMA smoothing for activity score — damps single-frame spikes
+_ACTIVITY_DX_WEIGHT = 2.0   # horizontal displacement weight (heavier — indicates engagement)
+_ACTIVITY_DY_WEIGHT = 1.0   # vertical displacement weight
 
 
 @dataclass
@@ -95,11 +98,13 @@ class PersonTracker:
             if best_iou >= _IOU_THRESHOLD and best_id is not None:
                 # Update existing track
                 track = self._tracks[best_id]
-                prev_center = _center(track.bbox)
-                curr_center = _center(det['bbox'])
-                activity = float(np.linalg.norm(
-                    np.array(curr_center) - np.array(prev_center)
-                ))
+                prev_cx, prev_cy = _center(track.bbox)
+                curr_cx, curr_cy = _center(det['bbox'])
+                dx = abs(curr_cx - prev_cx)
+                dy = abs(curr_cy - prev_cy)
+                raw_weighted = dx * _ACTIVITY_DX_WEIGHT + dy * _ACTIVITY_DY_WEIGHT
+                activity = (_ACTIVITY_EMA_ALPHA * raw_weighted
+                            + (1.0 - _ACTIVITY_EMA_ALPHA) * track.activity_score)
                 # Smooth bbox toward new detection to suppress frame-to-frame jitter
                 track.bbox = tuple(
                     int(old * (1 - _BBOX_ALPHA) + new * _BBOX_ALPHA)

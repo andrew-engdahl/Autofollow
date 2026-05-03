@@ -70,7 +70,7 @@ class AppState:
         self.tracking_mode: str = config.TRACKING_MODE   # 'primary' | 'switcher'
         self.shot_type: str = config.SHOT_TYPE
         self.switch_mode: str = config.SWITCH_MODE       # 'cut' | 'crossfade'
-        self.switch_trigger: str = config.SWITCH_TRIGGER # 'time' | 'activity' | 'manual'
+        self.switch_trigger: str = config.SWITCH_TRIGGER # 'time' | 'manual'
         self.switch_interval: float = config.SWITCH_INTERVAL
         self.crossfade_duration: float = config.CROSSFADE_DURATION
         self.manual_switch_id: str | None = None         # set by UI, consumed by video thread
@@ -141,10 +141,14 @@ class VideoThread(QThread):
         self._primary_pretraveling: bool = False
         self._primary_pretravel_start: float = 0.0
         self._primary_fade_start: float | None = None
+        self._primary_last_switch_time: float = 0.0      # enforces 1s minimum dwell
         # Wide-shot state: entered when no subjects detected
         self._wide_shot_active: bool = False
         self._wide_shot_fade_start: float | None = None   # None = cut already applied
         self._wide_shot_reacquire_at: float = 0.0         # earliest time to leave wide-shot
+        # Disabled-mode transition state
+        self._disabled_transitioning: bool = False
+        self._disabled_transition_start: float | None = None
 
     # ------------------------------------------------------------------
 
@@ -236,15 +240,50 @@ class VideoThread(QThread):
         mode = settings['tracking_mode']
         shot_type = settings['shot_type']
         diagnostics = settings.get('show_diagnostics', False)
+        auto_enabled = settings.get('auto_follow_enabled', True)
 
-        if not settings.get('auto_follow_enabled', True):
+        if not auto_enabled:
+            sw_mode = settings['switch_mode']
+            xfade_dur = settings['crossfade_duration']
             tx, ty, tz = self._framing._default_target()
-            sx, sy, sz = self._smoother.update('__passthrough__', tx, ty, tz)
-            output_frame = self._framing.apply_crop(frame, sx, sy, sz)
-            active_id = 'disabled'
+
+            # On the first frame of a disable, seed the from-smoother with the
+            # current live camera position so the transition starts from there.
+            if not self._disabled_transitioning:
+                self._disabled_transitioning = True
+                live = self._smoother.get_state('primary')
+                seed = dict(live) if live else {'x': tx, 'y': ty, 'zoom': tz}
+                self._smoother._state['__disabled_from__'] = seed
+                if sw_mode == 'crossfade':
+                    self._disabled_transition_start = time.monotonic()
+                else:
+                    self._disabled_transition_start = None  # cut: skip blend
+
+            if self._disabled_transition_start is not None:
+                elapsed_t = time.monotonic() - self._disabled_transition_start
+                t = min(1.0, elapsed_t / max(xfade_dur, 0.001))
+                px, py, pz = self._smoother.update('__passthrough__', tx, ty, tz)
+                frame_to = self._framing.apply_crop(frame, px, py, pz)
+                if t < 1.0:
+                    fx, fy, fz = self._smoother.update('__disabled_from__', tx, ty, tz)
+                    frame_from = self._framing.apply_crop(frame, fx, fy, fz)
+                    output_frame = cv2.addWeighted(frame_from, 1.0 - t, frame_to, t, 0)
+                else:
+                    self._disabled_transition_start = None
+                    output_frame = frame_to
+            else:
+                px, py, pz = self._smoother.update('__passthrough__', tx, ty, tz)
+                output_frame = self._framing.apply_crop(frame, px, py, pz)
+
             elapsed = time.monotonic() - t0
             fps = 1.0 / elapsed if elapsed > 0 else 0.0
-            return _bgr_to_qimage(output_frame), {'fps': fps, 'n_persons': len(persons), 'active_id': active_id}
+            return _bgr_to_qimage(output_frame), {
+                'fps': fps, 'n_persons': len(persons), 'active_id': 'disabled'
+            }
+
+        # Auto-follow enabled — clear disabled transition state so next disable starts fresh
+        self._disabled_transitioning = False
+        self._disabled_transition_start = None
 
         if mode == 'primary' or not persons:
             output_frame = self._render_primary(frame, persons, shot_type, diagnostics, settings)
@@ -437,21 +476,26 @@ class VideoThread(QThread):
             self._primary_pending_id = None
             self._primary_pretraveling = False
             self._primary_fade_start = None
+            self._primary_last_switch_time = now
 
         current_p = next((p for p in persons if p.id == self._primary_id), persons[0])
 
-        # --- Candidate selection: nearest first, activity as tiebreaker ---
+        # --- Candidate selection: nearest (by fg_score) or significantly more active ---
         # persons[] is sorted foreground_score desc (nearest = persons[0])
         nearest = persons[0]
         if nearest.id != self._primary_id and self._primary_pending_id is None:
-            fg_ratio = nearest.foreground_score / max(current_p.foreground_score, 1e-6)
-            act_ratio = nearest.activity_score / max(current_p.activity_score, 1e-6)
-            # 15% bigger bbox = clearly closer; or similar distance but 2× more active
-            if fg_ratio >= 1.15 or (fg_ratio >= 0.85 and act_ratio >= 2.0):
-                self._primary_pending_id = nearest.id
-                self._primary_pretraveling = True
-                self._primary_pretravel_start = now
-                self._primary_fade_start = None
+            if now - self._primary_last_switch_time >= 1.0:
+                fg_ratio = nearest.foreground_score / max(current_p.foreground_score, 1e-6)
+                cand_act = nearest.activity_score
+                curr_act = current_p.activity_score
+                # Activity switch: candidate must clear a noise floor (5.0 weighted px/frame
+                # after EMA) and be at least 1.5× more active than the current subject.
+                activity_wins = cand_act >= 5.0 and cand_act > curr_act * 1.5
+                if fg_ratio >= 1.15 or activity_wins:
+                    self._primary_pending_id = nearest.id
+                    self._primary_pretraveling = True
+                    self._primary_pretravel_start = now
+                    self._primary_fade_start = None
 
         # --- Phase 1: pretravel ---
         if self._primary_pretraveling:
@@ -467,6 +511,7 @@ class VideoThread(QThread):
                 if sw_mode == 'cut':
                     self._primary_id = self._primary_pending_id
                     self._primary_pending_id = None
+                    self._primary_last_switch_time = now
                 else:
                     self._primary_fade_start = now
             src = self._annotate_frame(frame, persons, self._primary_id) if diagnostics else frame
@@ -510,6 +555,7 @@ class VideoThread(QThread):
                 self._primary_id = self._primary_pending_id
                 self._primary_pending_id = None
                 self._primary_fade_start = None
+                self._primary_last_switch_time = now
 
             return blended
 
@@ -719,17 +765,18 @@ class ControlWindow(QMainWindow):
         trig_label = QLabel("Mode:")
         self._trig_group = QButtonGroup()
         triggers = [
-            ("Disabled",      "disabled"),
-            ("Primary Focus", "primary"),
-            ("Time",          "time"),
-            ("Activity",      "activity"),
-            ("Manual",        "manual"),
+            ("Disabled", "disabled"),
+            ("Primary",  "primary"),
+            ("Time",     "time"),
+            ("Manual",   "manual"),
         ]
         # Determine initial checked state
+        _valid_triggers = {t[1] for t in triggers}
         current_trigger = (
             "disabled" if not self._state.auto_follow_enabled
             else "primary" if self._state.tracking_mode == 'primary'
             else self._state.switch_trigger
+                if self._state.switch_trigger in _valid_triggers else "time"
         )
         for label, key in triggers:
             rb = QRadioButton(label)

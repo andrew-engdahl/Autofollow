@@ -15,10 +15,9 @@ _PRETRAVEL_DURATION = 0.5
 class VirtualSwitcher:
     """Decides when and how to switch between tracked persons.
 
-    Supports three trigger modes:
-        'time'     — auto-switch on a configurable interval
-        'activity' — switch to the most-active person that isn't currently shown
-        'manual'   — only switch when force_switch() is called explicitly
+    Supports two trigger modes:
+        'time'   — auto-switch on a configurable interval
+        'manual' — only switch when force_switch() is called explicitly
 
     Supports two transition modes:
         'cut'       — immediate switch
@@ -133,19 +132,6 @@ class VirtualSwitcher:
                     target = ids[(current_idx + 1) % len(ids)]
                 except ValueError:
                     target = ids[0]
-
-        if target is None and self.trigger == 'activity' and len(persons) > 1:
-            # Enforce a minimum dwell time between activity-triggered switches
-            if now - self._last_switch_time >= max(self.interval, 2.0):
-                others = [p for p in persons if p.id != self.active_id]
-                if others:
-                    most_active = max(others, key=lambda p: p.activity_score)
-                    current = next((p for p in persons if p.id == self.active_id), None)
-                    current_score = current.activity_score if current else 0.0
-                    # Candidate must exceed an absolute floor AND be 2× more active than current
-                    if (most_active.activity_score >= 12.0
-                            and most_active.activity_score > current_score * 2.0):
-                        target = most_active.id
 
         if target is not None and not is_manual:
             # Only auto-switch if the candidate is significantly displaced from the
