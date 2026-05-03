@@ -9,11 +9,11 @@ OUTPUT_ASPECT_RATIO = 16 / 9
 CONFIDENCE_THRESHOLD = 0.7
 YOLO_MODEL = 'yolov8n-pose.pt'    # nano=n, small=s, medium=m, large=l
 DETECTION_SCALE = 0.5             # Run YOLO on this fraction of input resolution (0.25–1.0)
-DETECTION_INTERVAL = 1            # Run pose detection every N frames (1 = every frame)
-MAX_PERSONS = 12                  # Maximum simultaneous tracked people
+DETECTION_INTERVAL = 2            # Run pose detection every N frames (1 = every frame)
+MAX_PERSONS = 10                  # Maximum simultaneous tracked people
 
 # Framing
-PADDING_RATIO = 0.25              # Padding around detected person bounding box
+PADDING_RATIO = 0.5              # Padding around detected person bounding box
 SHOT_TYPE = 'waist_up'            # 'full_body' | 'waist_up' | 'medium' | 'close_up'
 MAX_ZOOM = 4.0                    # Maximum zoom factor
 DEADZONE = 0.4                    # Horizontal deadzone (0–1): fraction of viewport where subject moves without panning
