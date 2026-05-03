@@ -38,6 +38,9 @@ def run_gui():
 
     app = QApplication(sys.argv)
     app.setApplicationName("Autofollow")
+    app.setApplicationDisplayName("Autofollow")
+    # Ensure the app comes to the foreground when launched from the Dock
+    app.setQuitOnLastWindowClosed(True)
 
     # ── Splash screen ────────────────────────────────────────────────────
     W, H = 520, 260

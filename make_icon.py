@@ -129,6 +129,12 @@ def build_icns(out_path: Path):
 
 
 if __name__ == '__main__':
-    resources = Path(__file__).parent / 'Autofollow.app' / 'Contents' / 'Resources'
+    import subprocess
+    project = Path(__file__).parent
+    resources = project / 'Autofollow.app' / 'Contents' / 'Resources'
     resources.mkdir(parents=True, exist_ok=True)
     build_icns(resources / 'AppIcon.icns')
+    app = project / 'Autofollow.app'
+    subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(app)], check=True)
+    subprocess.run(['xattr', '-dr', 'com.apple.quarantine', str(app)], check=False)
+    print("App bundle signed and quarantine cleared.")

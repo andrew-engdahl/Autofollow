@@ -1,16 +1,17 @@
 #!/bin/bash
-# Autofollow.app — macOS application bundle launcher.
-# The bundle lives at <project>/Autofollow.app, so Contents/MacOS is
-# three levels below the project root.
+# Autofollow.app — macOS Dock launcher.
+# Uses python -S (no-site / isolated) to skip pyvenv.cfg so the app can
+# launch from the Dock without needing Full Disk Access permission.
 
 MACOS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_DIR="$( cd "$MACOS_DIR/../../.." && pwd )"
 
-VENV="$PROJECT_DIR/.venv/bin/python3"
+PYTHON="/opt/homebrew/Cellar/python@3.13/3.13.3/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
+SITE="$PROJECT_DIR/.venv/lib/python3.13/site-packages"
 MAIN="$PROJECT_DIR/main.py"
 
-if [ ! -f "$VENV" ]; then
-    osascript -e "display alert \"Autofollow\" message \"Virtual environment not found.\n\nExpected:\n$VENV\n\nRun setup.sh first.\" as critical"
+if [ ! -f "$PYTHON" ]; then
+    osascript -e "display alert \"Autofollow\" message \"Python 3.13 not found.\n\nExpected:\n$PYTHON\n\nRe-run setup.sh then rebuild the app bundle.\" as critical"
     exit 1
 fi
 
@@ -19,4 +20,22 @@ if [ ! -f "$MAIN" ]; then
     exit 1
 fi
 
-exec "$VENV" "$MAIN"
+cd "$PROJECT_DIR"
+
+# -S skips site.py and pyvenv.cfg — we inject the venv site-packages and
+# project root ourselves via PYTHONPATH before importing anything.
+export PYTHONPATH="$SITE:$PROJECT_DIR"
+exec "$PYTHON" -S -c "
+import sys, sysconfig
+
+# Restore stdlib paths that -S strips out
+for p in (sysconfig.get_path('platstdlib'), sysconfig.get_path('stdlib')):
+    if p and p not in sys.path:
+        sys.path.append(p)
+
+# Fix argv so argparse sees no extra arguments
+sys.argv = sys.argv[1:]
+
+import runpy
+runpy.run_path(sys.argv[0], run_name='__main__')
+" "$MAIN"
