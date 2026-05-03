@@ -2,8 +2,11 @@
 
 Axis behaviour
 --------------
-X (pan)   – primary motion; quadratic ease-out only fires when the subject
-             leaves the deadzone.  SMOOTHING controls the baseline lerp rate.
+X (pan)   – primary motion; quadratic ease-out fires when the subject leaves
+             the deadzone.  The quad ramp is based on how far the subject center
+             has moved *past* the deadzone edge (0 = just left deadzone,
+             1 = at _REF_PAN_DISTANCE beyond it), so the camera starts very
+             gently and accelerates smoothly rather than lurching at the start.
 Y (tilt)  – secondary; plain lerp at a much slower rate so the camera barely
              tilts unless the subject is truly out of frame vertically.
 Z (zoom)  – secondary; same treatment as tilt, even slower, so zoom changes
@@ -22,13 +25,12 @@ _PAN_MIN_ALPHA  = 0.02   # factor at SMOOTHING=1
 _TILT_ALPHA_SCALE = 0.20  # tilt lerp = pan_alpha * this
 _ZOOM_ALPHA_SCALE = 0.10  # zoom lerp = pan_alpha * this
 
-# Quadratic ramp: camera accelerates when subject is far from target.
-# Kept modest so fast moves don't look like a whip pan.
+# Quadratic ramp: camera accelerates when subject is far past the deadzone edge.
+# normalized=0 → at deadzone boundary, normalized=1 → _REF_PAN_DISTANCE beyond it.
 _PAN_QUAD_MAX = 0.30
-_REF_PAN_DISTANCE = 300.0   # pixels — distance at which quad factor reaches _PAN_QUAD_MAX
+_REF_PAN_DISTANCE = 300.0   # pixels of subject overshoot at which quad reaches max
 
 # Hard speed caps — pixels (or zoom units) per frame.
-# These are the absolute ceiling regardless of the lerp calculation.
 _MAX_PAN_SPEED  = 15    # px/frame  (~450px/s at 30fps — smooth but responsive)
 _MAX_TILT_SPEED = 3     # px/frame
 _MAX_ZOOM_SPEED = 0.015 # zoom units/frame
@@ -49,13 +51,20 @@ def _lerp_step(current: float, target: float, alpha: float, max_speed: float) ->
     return current + movement
 
 
-def _pan_step(current: float, target: float) -> float:
-    """Quadratic ease-out pan: accelerates when far, gentle when close."""
+def _pan_step(current: float, target: float, subject_overshoot: float = 1.0) -> float:
+    """Quadratic ease-out pan.
+
+    subject_overshoot: normalized distance the subject center has moved past
+    the deadzone edge, clamped to [0, 1].  0 = just left the deadzone
+    (camera barely moves), 1 = fully out at _REF_PAN_DISTANCE (full quad
+    factor).  Defaults to 1.0 when no deadzone info is available so the
+    behaviour is unchanged for callers that don't pass it.
+    """
     error = target - current
     if error == 0.0:
         return current
     base = _pan_alpha()
-    normalized = min(1.0, abs(error) / _REF_PAN_DISTANCE)
+    normalized = max(0.0, min(1.0, subject_overshoot))
     factor = base + (_PAN_QUAD_MAX - base) * normalized ** 2
     movement = factor * error
     movement = max(-_MAX_PAN_SPEED, min(_MAX_PAN_SPEED, movement))
@@ -90,11 +99,12 @@ class PTZSmoother:
 
         # ── X (pan): quadratic ease-out, only outside the deadzone ──────────
         effective_target_x = target_x
+        subject_overshoot = 1.0
         if person_center_x is not None and crop_width is not None:
-            effective_target_x = self._apply_deadzone(
+            effective_target_x, subject_overshoot = self._apply_deadzone(
                 curr_x, target_x, person_center_x, crop_width
             )
-        new_x = _pan_step(curr_x, effective_target_x)
+        new_x = _pan_step(curr_x, effective_target_x, subject_overshoot)
 
         # ── Y (tilt): slow lerp ──────────────────────────────────────────────
         tilt_alpha = _pan_alpha() * _TILT_ALPHA_SCALE
@@ -118,17 +128,32 @@ class PTZSmoother:
 
     @staticmethod
     def _apply_deadzone(current_x: float, target_x: float,
-                        person_center_x: float, crop_width: float) -> float:
-        """Hold pan while subject stays within the deadzone; ramp outside it."""
+                        person_center_x: float, crop_width: float
+                        ) -> tuple[float, float]:
+        """Hold pan while subject stays within the deadzone; ramp outside it.
+
+        Returns:
+            (effective_target_x, subject_overshoot)
+            subject_overshoot is in [0, 1]: how far past the deadzone edge the
+            subject center is, normalized by _REF_PAN_DISTANCE.  Used by
+            _pan_step to scale the quadratic factor so motion starts gently
+            right at the deadzone boundary.
+        """
         viewport_center = current_x + crop_width / 2.0
         distance = abs(person_center_x - viewport_center)
         half_deadzone = (crop_width * config.DEADZONE) / 2.0
         inner_deadzone = half_deadzone * 0.5
 
         if distance <= inner_deadzone:
-            return current_x
-        elif distance <= half_deadzone:
+            return current_x, 0.0
+
+        if distance <= half_deadzone:
+            # Soft inner ramp: partial target blend, low overshoot
             t = (distance - inner_deadzone) / (half_deadzone - inner_deadzone)
-            return current_x + t ** 2 * (target_x - current_x)
-        else:
-            return target_x
+            blended_target = current_x + t ** 2 * (target_x - current_x)
+            overshoot = min(1.0, (distance - inner_deadzone) / _REF_PAN_DISTANCE)
+            return blended_target, overshoot
+
+        # Outside hard deadzone edge: full target, overshoot based on how far past edge
+        overshoot = min(1.0, (distance - half_deadzone) / _REF_PAN_DISTANCE)
+        return target_x, overshoot

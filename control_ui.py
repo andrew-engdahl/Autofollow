@@ -159,6 +159,7 @@ class VideoThread(QThread):
         self._primary_fade_start: float | None = None
         self._primary_last_switch_time: float = time.monotonic()  # enforces 1s minimum dwell
         self._last_recovery_far: bool = False  # True = recovery moved camera; False = near/silent
+        self._last_recovery_time: float = 0.0  # monotonic time of last recovery reassignment
         # Wide-shot state: entered when no subjects detected
         self._wide_shot_active: bool = False
         self._wide_shot_fade_start: float | None = None   # None = cut already applied
@@ -301,7 +302,8 @@ class VideoThread(QThread):
             # Emit diagnostics frame even in disabled mode
             diag_frame = self._annotate_diag_frame(frame, persons,
                                                     self._primary_id or '',
-                                                    self._person_index_map)
+                                                    self._person_index_map,
+                                                    settings.get('foreground_exclusion_y', 0.0))
             self.diag_frame_ready.emit(_bgr_to_qimage(diag_frame))
 
             elapsed = time.monotonic() - t0
@@ -322,7 +324,8 @@ class VideoThread(QThread):
 
         # Emit the color-coded diagnostics preview (raw input + overlays, never cropped)
         diag_frame = self._annotate_diag_frame(frame, persons, active_id,
-                                               self._person_index_map)
+                                               self._person_index_map,
+                                               settings.get('foreground_exclusion_y', 0.0))
         self.diag_frame_ready.emit(_bgr_to_qimage(diag_frame))
 
         elapsed = time.monotonic() - t0
@@ -369,7 +372,8 @@ class VideoThread(QThread):
 
     @staticmethod
     def _annotate_diag_frame(frame: np.ndarray, persons, primary_id: str,
-                              person_index_map: dict) -> np.ndarray:
+                              person_index_map: dict,
+                              foreground_exclusion_y: float = 0.0) -> np.ndarray:
         """Render color-coded skeleton overlays on the raw input frame.
 
         Each person gets a unique hue (golden-angle spacing).  The body
@@ -451,6 +455,29 @@ class VideoThread(QThread):
 
         # Blend silhouette overlay at 35% opacity
         cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
+
+        # ── Audience exclusion zone ───────────────────────────────────────
+        if foreground_exclusion_y > 0.0:
+            excl_y = int(h * (1.0 - foreground_exclusion_y))
+            yellow = (0, 220, 220)  # BGR yellow
+
+            # Semi-transparent filled region with diagonal hatching
+            excl_overlay = out.copy()
+            cv2.rectangle(excl_overlay, (0, excl_y), (w, h), yellow, -1)
+            cv2.addWeighted(excl_overlay, 0.15, out, 0.85, 0, out)
+
+            # Diagonal stripes over the exclusion region
+            stripe_overlay = out.copy()
+            stripe_gap = 18
+            for x_start in range(-h, w, stripe_gap):
+                pt1 = (x_start, excl_y)
+                pt2 = (x_start + (h - excl_y), h)
+                cv2.line(stripe_overlay, pt1, pt2, yellow, 1, cv2.LINE_AA)
+            cv2.addWeighted(stripe_overlay, 0.45, out, 0.55, 0, out)
+
+            # Solid border line along the top edge of the exclusion zone
+            cv2.line(out, (0, excl_y), (w, excl_y), yellow, 2, cv2.LINE_AA)
+
         return out
 
     # ------------------------------------------------------------------
@@ -542,36 +569,44 @@ class VideoThread(QThread):
         # the new person is spatially far from the current camera position.  This
         # prevents the rapid-recovery pattern from spamming dwell resets and
         # causing constant panning when nobody is actually moving.
+        #
+        # Recovery cooldown: after a recovery reassignment, ignore further ID drops
+        # for _RECOVERY_COOLDOWN seconds.  This prevents ID churn from producing a
+        # chain of rapid-fire panning recoveries.
+        _RECOVERY_COOLDOWN = 3.0  # seconds to suppress further recovery reassignments
         if self._primary_id not in current_ids:
-            new_primary = persons[0].id
-            self._primary_id = new_primary
-            self._primary_pending_id = None
-            self._primary_pretraveling = False
-            self._primary_fade_start = None
+            cooldown_active = (now - self._last_recovery_time) < _RECOVERY_COOLDOWN
+            if not cooldown_active:
+                new_primary = persons[0].id
+                self._primary_id = new_primary
+                self._primary_pending_id = None
+                self._primary_pretraveling = False
+                self._primary_fade_start = None
+                self._last_recovery_time = now
 
-            # Only reset the dwell clock if the camera needs to move significantly
-            # to cover the new primary.  "Significantly" = new person's center is
-            # more than 30% of the current crop width away from the camera center.
-            smoother_state = self._smoother.get_state('primary')
-            if smoother_state is not None:
-                crop_w = config.OUTPUT_WIDTH / max(smoother_state['zoom'], 0.01)
-                cam_cx = smoother_state['x'] + crop_w / 2.0
-                new_p = next((p for p in persons if p.id == new_primary), None)
-                if new_p is not None:
-                    new_cx = (new_p.bbox[0] + new_p.bbox[2]) / 2.0
-                    displacement = abs(new_cx - cam_cx)
-                    if displacement > crop_w * 0.30:
-                        self._primary_last_switch_time = now
-                        self._last_recovery_far = True
+                # Only reset the dwell clock if the camera needs to move significantly
+                # to cover the new primary.  "Significantly" = new person's center is
+                # more than 30% of the current crop width away from the camera center.
+                smoother_state = self._smoother.get_state('primary')
+                if smoother_state is not None:
+                    crop_w = config.OUTPUT_WIDTH / max(smoother_state['zoom'], 0.01)
+                    cam_cx = smoother_state['x'] + crop_w / 2.0
+                    new_p = next((p for p in persons if p.id == new_primary), None)
+                    if new_p is not None:
+                        new_cx = (new_p.bbox[0] + new_p.bbox[2]) / 2.0
+                        displacement = abs(new_cx - cam_cx)
+                        if displacement > crop_w * 0.30:
+                            self._primary_last_switch_time = now
+                            self._last_recovery_far = True
+                        else:
+                            self._last_recovery_far = False  # near/silent
                     else:
-                        self._last_recovery_far = False  # near/silent
+                        self._last_recovery_far = False
                 else:
-                    self._last_recovery_far = False
-                # else: new person is close — silent reassignment, dwell clock untouched
-            else:
-                # No smoother state yet (very first frame) — reset is fine
-                self._primary_last_switch_time = now
-                self._last_recovery_far = True
+                    # No smoother state yet (very first frame) — reset is fine
+                    self._primary_last_switch_time = now
+                    self._last_recovery_far = True
+            # else: cooldown active — hold current smoother position, skip reassignment
 
         current_p = next((p for p in persons if p.id == self._primary_id), persons[0])
 

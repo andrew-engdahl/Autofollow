@@ -37,7 +37,7 @@ SHOT_TYPE_ZOOM = {
 #            1 = very smooth / noticeably delayed movement.
 # Panning (X) is the primary motion axis; tilt (Y) and zoom (Z) are secondary
 # and are smoothed much more aggressively to keep them nearly static.
-SMOOTHING = 0.3                   # 0–1 user-facing smoothing dial
+SMOOTHING = 0.5                  # 0–1 user-facing smoothing dial
 MAX_PAN_SPEED = 15                # Maximum pan movement in pixels per frame
 MAX_TILT_SPEED = 3                # Maximum tilt movement in pixels per frame (slow)
 MAX_ZOOM_SPEED = 0.015            # Maximum zoom change per frame (very slow)
