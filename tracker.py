@@ -43,9 +43,34 @@ def _iou(a, b):
     return inter / (area_a + area_b - inter)
 
 
+# COCO keypoint indices that define the torso
+_TORSO_KP_INDICES = (5, 6, 11, 12)  # left shoulder, right shoulder, left hip, right hip
+
+
 def _center(bbox):
     x1, y1, x2, y2 = bbox
     return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+
+def _torso_center(keypoints: np.ndarray, frame_w: float, frame_h: float,
+                  bbox=None) -> tuple[float, float]:
+    """Return the median (cx, cy) of visible torso keypoints in pixel coords.
+
+    Falls back to bbox center if no torso keypoints are confident enough.
+    keypoints: (17, 4) array — [x_norm, y_norm, 0, conf]
+    """
+    pts = []
+    for idx in _TORSO_KP_INDICES:
+        kp = keypoints[idx]
+        if kp[3] > 0.3:  # confidence threshold
+            pts.append((kp[0] * frame_w, kp[1] * frame_h))
+    if pts:
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return (float(np.median(xs)), float(np.median(ys)))
+    if bbox is not None:
+        return _center(bbox)
+    return (frame_w / 2.0, frame_h / 2.0)
 
 
 def _area(bbox):
@@ -76,13 +101,16 @@ class PersonTracker:
         fh, fw = frame_shape[:2]
         self._frame_area = max(1.0, float(fw * fh))
 
-        # Drop detections whose bottom edge falls in the foreground exclusion zone.
-        # Audience members standing in front of the stage appear in the lower part of
-        # the frame; performers on stage are higher up.
+        # Drop detections whose torso center falls in the foreground exclusion zone.
+        # Using the torso center (median of shoulders + hips) means a performer on stage
+        # whose legs extend into the exclusion zone is still tracked correctly.
         excl = foreground_exclusion_y if foreground_exclusion_y is not None else _DEFAULT_EXCLUSION_Y
         if excl > 0.0:
             exclusion_threshold = fh * (1.0 - excl)
-            detections = [d for d in detections if d['bbox'][3] <= exclusion_threshold]
+            detections = [
+                d for d in detections
+                if _torso_center(d['keypoints'], fw, fh, d['bbox'])[1] <= exclusion_threshold
+            ]
 
         # Increment unseen counter for all existing tracks
         for t in self._tracks.values():
@@ -167,8 +195,8 @@ class PersonTracker:
         for det_idx, tid in det_to_track.items():
             det = detections[det_idx]
             track = self._tracks[tid]
-            prev_cx, prev_cy = _center(track.bbox)
-            curr_cx, curr_cy = _center(det['bbox'])
+            prev_cx, prev_cy = _torso_center(track.keypoints, fw, fh, track.bbox)
+            curr_cx, curr_cy = _torso_center(det['keypoints'], fw, fh, det['bbox'])
             dx = abs(curr_cx - prev_cx)
             dy = abs(curr_cy - prev_cy)
             raw_weighted = dx * _ACTIVITY_DX_WEIGHT + dy * _ACTIVITY_DY_WEIGHT
