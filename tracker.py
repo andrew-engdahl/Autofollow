@@ -4,8 +4,8 @@ import numpy as np
 from dataclasses import dataclass, field
 from config import MAX_PERSONS, FOREGROUND_EXCLUSION_Y as _DEFAULT_EXCLUSION_Y
 
-_DROPOUT_FRAMES = 30    # drop a track after this many consecutive unmatched frames (~1s at 30fps)
-_IOU_THRESHOLD = 0.15   # minimum IoU to match; lowered to tolerate fast movement
+_DROPOUT_FRAMES = 60    # drop a track after this many consecutive unmatched frames (~2s at 30fps)
+_IOU_THRESHOLD = 0.10   # minimum IoU to match; lowered to tolerate fast movement
 _BBOX_ALPHA = 0.5       # bbox smoothing: higher = follows detection more closely (less lag)
 _ACTIVITY_EMA_ALPHA = 0.3   # EMA smoothing for activity score — damps single-frame spikes
 _ACTIVITY_DX_WEIGHT = 2.0   # horizontal displacement weight (heavier — indicates engagement)
@@ -13,7 +13,7 @@ _ACTIVITY_DY_WEIGHT = 1.0   # vertical displacement weight
 
 # Center-distance fallback matching: if IoU is too low (person moved fast), accept a
 # match when the detection center is within this fraction of the frame's diagonal.
-_CENTER_DIST_FALLBACK = 0.15   # fraction of frame diagonal (~0.15 = generous for fast movers)
+_CENTER_DIST_FALLBACK = 0.25   # fraction of frame diagonal — generous to handle fast movers
 
 
 _FG_SCORE_EMA_ALPHA = 0.15   # heavy smoothing on bbox-area score to prevent fg_ratio oscillation
@@ -88,9 +88,9 @@ class PersonTracker:
         for t in self._tracks.values():
             t.frames_unseen += 1
 
-        # Greedy matching: IoU first, center-distance fallback for fast movers.
-        # The fallback prevents ID churn when a person moves quickly enough that
-        # their new detection has little overlap with their previous bbox.
+        # Matching: build a full IoU matrix, then greedily assign best pairs
+        # (highest IoU first) to reduce the "greedy order" artifacts where a
+        # low-confidence pair steals a track from a better match further down.
         frame_diag = (fh ** 2 + fw ** 2) ** 0.5
         max_center_dist = frame_diag * _CENTER_DIST_FALLBACK
 
@@ -98,55 +98,94 @@ class PersonTracker:
         matched_ids = set()
         matched_det_indices = set()
 
+        # Phase 1: IoU matching — collect all (iou, det_idx, track_id) pairs,
+        # sort descending by IoU, then greedily assign best-first.
+        iou_pairs = []
         for det_idx, det in enumerate(detections):
-            best_iou, best_id = 0.0, None
+            for tid in existing_ids:
+                score = _iou(det['bbox'], self._tracks[tid].bbox)
+                if score >= _IOU_THRESHOLD:
+                    iou_pairs.append((score, det_idx, tid))
+        iou_pairs.sort(reverse=True)
+
+        for score, det_idx, tid in iou_pairs:
+            if det_idx in matched_det_indices or tid in matched_ids:
+                continue
+            matched_ids.add(tid)
+            matched_det_indices.add(det_idx)
+
+        # Phase 2: center-distance fallback for unmatched detections
+        for det_idx, det in enumerate(detections):
+            if det_idx in matched_det_indices:
+                continue
+            best_id = None
+            best_dist = max_center_dist
+            dcx, dcy = _center(det['bbox'])
             for tid in existing_ids:
                 if tid in matched_ids:
                     continue
-                score = _iou(det['bbox'], self._tracks[tid].bbox)
-                if score > best_iou:
-                    best_iou, best_id = score, tid
-
-            # Primary match: IoU above threshold
-            if best_iou >= _IOU_THRESHOLD and best_id is not None:
-                pass  # accepted — fall through to update block below
-            else:
-                # Fallback: find the nearest unmatched track by center distance
-                best_id = None
-                best_dist = max_center_dist
-                dcx, dcy = _center(det['bbox'])
-                for tid in existing_ids:
-                    if tid in matched_ids:
-                        continue
-                    tcx, tcy = _center(self._tracks[tid].bbox)
-                    dist = ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5
-                    if dist < best_dist:
-                        best_dist, best_id = dist, tid
-
+                tcx, tcy = _center(self._tracks[tid].bbox)
+                dist = ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist, best_id = dist, tid
             if best_id is not None:
-                # Update existing track
-                track = self._tracks[best_id]
-                prev_cx, prev_cy = _center(track.bbox)
-                curr_cx, curr_cy = _center(det['bbox'])
-                dx = abs(curr_cx - prev_cx)
-                dy = abs(curr_cy - prev_cy)
-                raw_weighted = dx * _ACTIVITY_DX_WEIGHT + dy * _ACTIVITY_DY_WEIGHT
-                activity = (_ACTIVITY_EMA_ALPHA * raw_weighted
-                            + (1.0 - _ACTIVITY_EMA_ALPHA) * track.activity_score)
-                # Smooth bbox toward new detection to suppress frame-to-frame jitter
-                track.bbox = tuple(
-                    int(old * (1 - _BBOX_ALPHA) + new * _BBOX_ALPHA)
-                    for old, new in zip(track.bbox, det['bbox'])
-                )
-                track.keypoints = det['keypoints']
-                track.confidence = det['confidence']
-                raw_fg = _area(track.bbox) / self._frame_area
-                track.foreground_score = (_FG_SCORE_EMA_ALPHA * raw_fg
-                                          + (1.0 - _FG_SCORE_EMA_ALPHA) * track.foreground_score)
-                track.activity_score = activity
-                track.frames_unseen = 0
                 matched_ids.add(best_id)
                 matched_det_indices.add(det_idx)
+
+        # Phase 3: apply updates for all matched pairs
+        # Re-derive the (det_idx → track_id) mapping from the two match phases.
+        # Rebuild by re-scanning (cheap — small N).
+        det_to_track: dict[int, str] = {}
+        # IoU matches
+        seen_d: set[int] = set()
+        seen_t: set[str] = set()
+        for score, det_idx, tid in iou_pairs:
+            if det_idx not in seen_d and tid not in seen_t:
+                det_to_track[det_idx] = tid
+                seen_d.add(det_idx)
+                seen_t.add(tid)
+        # Center-distance matches (re-run to get the actual assignments)
+        for det_idx, det in enumerate(detections):
+            if det_idx in det_to_track:
+                continue
+            best_id = None
+            best_dist = max_center_dist
+            dcx, dcy = _center(det['bbox'])
+            for tid in existing_ids:
+                if tid in seen_t:
+                    continue
+                tcx, tcy = _center(self._tracks[tid].bbox)
+                dist = ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist, best_id = dist, tid
+            if best_id is not None:
+                det_to_track[det_idx] = best_id
+                seen_t.add(best_id)
+
+        matched_det_indices = set(det_to_track.keys())
+
+        for det_idx, tid in det_to_track.items():
+            det = detections[det_idx]
+            track = self._tracks[tid]
+            prev_cx, prev_cy = _center(track.bbox)
+            curr_cx, curr_cy = _center(det['bbox'])
+            dx = abs(curr_cx - prev_cx)
+            dy = abs(curr_cy - prev_cy)
+            raw_weighted = dx * _ACTIVITY_DX_WEIGHT + dy * _ACTIVITY_DY_WEIGHT
+            activity = (_ACTIVITY_EMA_ALPHA * raw_weighted
+                        + (1.0 - _ACTIVITY_EMA_ALPHA) * track.activity_score)
+            # Smooth bbox toward new detection to suppress frame-to-frame jitter
+            track.bbox = tuple(
+                int(old * (1 - _BBOX_ALPHA) + new * _BBOX_ALPHA)
+                for old, new in zip(track.bbox, det['bbox'])
+            )
+            track.keypoints = det['keypoints']
+            track.confidence = det['confidence']
+            raw_fg = _area(track.bbox) / self._frame_area
+            track.foreground_score = (_FG_SCORE_EMA_ALPHA * raw_fg
+                                      + (1.0 - _FG_SCORE_EMA_ALPHA) * track.foreground_score)
+            track.activity_score = activity
+            track.frames_unseen = 0
 
         # Create new tracks for unmatched detections (up to max_persons limit)
         limit = max_persons if max_persons is not None else MAX_PERSONS

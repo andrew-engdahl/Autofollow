@@ -40,6 +40,15 @@ _SKELETON = [
     (12, 14), (14, 16),       # right leg
 ]
 
+# Per-person colors: evenly-spaced hues around the HSV wheel (BGR).
+# Up to 12 persons (matching MAX_PERSONS); cycles if more.
+def _person_color(index: int) -> tuple[int, int, int]:
+    """Return a vivid BGR color for person at position `index` (0-based)."""
+    hue = int((index * 137.5) % 180)   # golden-angle step keeps neighbours distinct
+    hsv = np.uint8([[[hue, 220, 230]]])
+    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]
+    return (int(bgr[0]), int(bgr[1]), int(bgr[2]))
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -120,7 +129,8 @@ class AppState:
 class VideoThread(QThread):
     """Captures, processes, and emits frames without blocking the UI."""
 
-    frame_ready = pyqtSignal(QImage, dict)   # (frame, metadata)
+    frame_ready = pyqtSignal(QImage, dict)   # (processed output frame, metadata)
+    diag_frame_ready = pyqtSignal(QImage)    # raw input frame with color-coded overlays
     camera_info = pyqtSignal(str)             # e.g. "1920x1080 @ 30fps"
     persons_updated = pyqtSignal(list)        # list of person IDs currently tracked
 
@@ -138,6 +148,9 @@ class VideoThread(QThread):
         self._switcher = VirtualSwitcher()
         self._frame_count = 0
 
+        self._person_index_map: dict[str, int] = {}   # stable color index per person ID
+        self._next_person_color_idx: int = 0
+
         self._primary_id: str | None = None
         # Transition state for Primary Focus mode (mirrors switcher logic)
         self._primary_pending_id: str | None = None
@@ -145,6 +158,7 @@ class VideoThread(QThread):
         self._primary_pretravel_start: float = 0.0
         self._primary_fade_start: float | None = None
         self._primary_last_switch_time: float = time.monotonic()  # enforces 1s minimum dwell
+        self._last_recovery_far: bool = False  # True = recovery moved camera; False = near/silent
         # Wide-shot state: entered when no subjects detected
         self._wide_shot_active: bool = False
         self._wide_shot_fade_start: float | None = None   # None = cut already applied
@@ -241,9 +255,14 @@ class VideoThread(QThread):
         # Emit tracked person IDs for UI person buttons
         self.persons_updated.emit([p.id for p in persons])
 
+        # Assign stable color indices to new person IDs
+        for p in persons:
+            if p.id not in self._person_index_map:
+                self._person_index_map[p.id] = self._next_person_color_idx
+                self._next_person_color_idx += 1
+
         mode = settings['tracking_mode']
         shot_type = settings['shot_type']
-        diagnostics = settings.get('show_diagnostics', False)
         auto_enabled = settings.get('auto_follow_enabled', True)
 
         if not auto_enabled:
@@ -279,6 +298,12 @@ class VideoThread(QThread):
                 px, py, pz = self._smoother.update('__passthrough__', tx, ty, tz)
                 output_frame = self._framing.apply_crop(frame, px, py, pz)
 
+            # Emit diagnostics frame even in disabled mode
+            diag_frame = self._annotate_diag_frame(frame, persons,
+                                                    self._primary_id or '',
+                                                    self._person_index_map)
+            self.diag_frame_ready.emit(_bgr_to_qimage(diag_frame))
+
             elapsed = time.monotonic() - t0
             fps = 1.0 / elapsed if elapsed > 0 else 0.0
             return _bgr_to_qimage(output_frame), {
@@ -290,10 +315,15 @@ class VideoThread(QThread):
         self._disabled_transition_start = None
 
         if mode == 'primary' or not persons:
-            output_frame = self._render_primary(frame, persons, shot_type, diagnostics, settings)
+            output_frame = self._render_primary(frame, persons, shot_type, settings)
             active_id = self._primary_id if self._primary_id else (persons[0].id if persons else 'none')
         else:
-            output_frame, active_id = self._render_switcher(frame, persons, shot_type, diagnostics)
+            output_frame, active_id = self._render_switcher(frame, persons, shot_type)
+
+        # Emit the color-coded diagnostics preview (raw input + overlays, never cropped)
+        diag_frame = self._annotate_diag_frame(frame, persons, active_id,
+                                               self._person_index_map)
+        self.diag_frame_ready.emit(_bgr_to_qimage(diag_frame))
 
         elapsed = time.monotonic() - t0
         fps = 1.0 / elapsed if elapsed > 0 else 0.0
@@ -328,6 +358,8 @@ class VideoThread(QThread):
             'dwell_threshold': 3.0,
             'mode': mode,
             'smoother_primary': self._smoother.get_state('primary'),
+            'last_recovery_far': self._last_recovery_far,
+            'person_index_map': dict(self._person_index_map),
         }
         return _bgr_to_qimage(output_frame), meta
 
@@ -336,92 +368,96 @@ class VideoThread(QThread):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _annotate_frame(frame: np.ndarray, persons, primary_id: str) -> np.ndarray:
-        """Draw skeleton and torso position box on the input frame.
+    def _annotate_diag_frame(frame: np.ndarray, persons, primary_id: str,
+                              person_index_map: dict) -> np.ndarray:
+        """Render color-coded skeleton overlays on the raw input frame.
 
-        Primary person: green.  All others: red.
-        Operates in input-pixel space so the annotation survives any crop/zoom.
+        Each person gets a unique hue (golden-angle spacing).  The body
+        silhouette — convex hull of all visible keypoints — is filled with a
+        semi-transparent wash of that color.  Skeleton lines and joint dots are
+        drawn on top in full color.  The primary person's bbox is outlined with
+        a brighter border and an ID label.
+
+        This output is only ever sent to the diagnostics preview; it never
+        touches the main output pipeline.
         """
         h, w = frame.shape[:2]
         out = frame.copy()
+        overlay = out.copy()
 
         for person in persons:
-            is_primary = person.id == primary_id
-            skel_color = (0, 220, 0) if is_primary else (0, 0, 220)
-            box_color  = (0, 220, 0) if is_primary else (0, 0, 220)
+            idx = person_index_map.get(person.id, 0)
+            color = _person_color(idx)
             kps = person.keypoints  # (17, 4) — [x_norm, y_norm, 0, conf]
 
             pts: dict[int, tuple[int, int]] = {}
-            for idx, kp in enumerate(kps):
+            for ki, kp in enumerate(kps):
                 if kp[3] > config.CONFIDENCE_THRESHOLD:
-                    pts[idx] = (int(kp[0] * w), int(kp[1] * h))
+                    pts[ki] = (int(kp[0] * w), int(kp[1] * h))
 
+            # ── Filled silhouette: convex hull of visible keypoints ──────
+            if len(pts) >= 3:
+                hull_pts = np.array(list(pts.values()), dtype=np.int32)
+                hull = cv2.convexHull(hull_pts)
+                cv2.fillConvexPoly(overlay, hull, color)
+
+            # ── Skeleton lines ───────────────────────────────────────────
             for a, b in _SKELETON:
                 if a in pts and b in pts:
-                    cv2.line(out, pts[a], pts[b], skel_color, 2)
+                    cv2.line(out, pts[a], pts[b], color, 2, cv2.LINE_AA)
 
-            # --- Torso position box ---
-            # Use shoulder/hip keypoints to define the torso rect; fall back to bbox.
-            torso_kp_indices = [5, 6, 11, 12]  # L-shoulder, R-shoulder, L-hip, R-hip
-            torso_pts = [pts[i] for i in torso_kp_indices if i in pts]
+            # ── Joint dots ───────────────────────────────────────────────
+            for pt in pts.values():
+                cv2.circle(out, pt, 4, color, -1, cv2.LINE_AA)
+                cv2.circle(out, pt, 4, (255, 255, 255), 1, cv2.LINE_AA)
 
-            if len(torso_pts) >= 2:
-                txs = [p[0] for p in torso_pts]
-                tys = [p[1] for p in torso_pts]
-                tx1, ty1, tx2, ty2 = min(txs), min(tys), max(txs), max(tys)
-            else:
-                # Fallback: upper half of bbox
-                bx1, by1, bx2, by2 = person.bbox
-                tx1, ty1, tx2 = bx1, by1, bx2
-                ty2 = by1 + (by2 - by1) // 2
+            # ── Bbox outline ─────────────────────────────────────────────
+            bx1, by1, bx2, by2 = person.bbox
+            is_primary = person.id == primary_id
+            border_thickness = 3 if is_primary else 1
+            cv2.rectangle(out, (bx1, by1), (bx2, by2), color, border_thickness, cv2.LINE_AA)
 
-            # Expand the torso rect slightly for readability
-            pad = 8
-            tx1 = max(0, tx1 - pad)
-            ty1 = max(0, ty1 - pad)
-            tx2 = min(w - 1, tx2 + pad)
-            ty2 = min(h - 1, ty2 + pad)
+            # ── Primary indicator: downward arrow above bbox + centroid halo
+            if is_primary:
+                cx_p = (bx1 + bx2) // 2
+                arrow_tip_y = by1 - 6
+                arrow_base_y = arrow_tip_y - 18
+                arrow_half_w = 10
+                # Filled downward-pointing triangle (arrow head)
+                tri = np.array([
+                    [cx_p,              arrow_tip_y],
+                    [cx_p - arrow_half_w, arrow_base_y],
+                    [cx_p + arrow_half_w, arrow_base_y],
+                ], dtype=np.int32)
+                cv2.fillConvexPoly(overlay, tri, (255, 255, 255))
+                cv2.polylines(out, [tri], True, color, 2, cv2.LINE_AA)
+                cv2.fillConvexPoly(out, tri, color)
+                # Bright halo ring at centroid
+                cy_p = (by1 + by2) // 2
+                cv2.circle(out, (cx_p, cy_p), 10, (255, 255, 255), 3, cv2.LINE_AA)
+                cv2.circle(out, (cx_p, cy_p), 10, color,           2, cv2.LINE_AA)
 
-            # Semi-transparent fill
-            overlay = out.copy()
-            cv2.rectangle(overlay, (tx1, ty1), (tx2, ty2), box_color, -1)
-            cv2.addWeighted(overlay, 0.15, out, 0.85, 0, out)
-            cv2.rectangle(out, (tx1, ty1), (tx2, ty2), box_color, 2)
-
-            # X, Y, Z axis values
-            # X: normalised horizontal center of bbox (-1 = left, +1 = right)
-            bx1_, by1_, bx2_, by2_ = person.bbox
-            px_norm = ((bx1_ + bx2_) / 2.0 / max(w, 1) - 0.5) * 2.0
-            # Y: normalised vertical center (−1 = top, +1 = bottom)
-            py_norm = ((by1_ + by2_) / 2.0 / max(h, 1) - 0.5) * 2.0
-            # Z: foreground proxy — bbox area relative to frame (0→1, bigger = closer)
-            pz = person.foreground_score  # already computed in tracker
-
-            label_lines = [
-                f"X:{px_norm:+.2f}",
-                f"Y:{py_norm:+.2f}",
-                f"Z:{pz:.3f}",
-            ]
+            # ── ID + score label ─────────────────────────────────────────
+            label = f"{'▶ ' if is_primary else ''}{person.id}"
             font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale, thickness = 0.45, 1
-            line_h = 14
-            text_x = tx1 + 4
-            text_y = ty1 + line_h
-            for ln in label_lines:
-                cv2.putText(out, ln, (text_x, text_y), font, font_scale,
-                            (0, 0, 0), thickness + 1, cv2.LINE_AA)
-                cv2.putText(out, ln, (text_x, text_y), font, font_scale,
-                            (255, 255, 255), thickness, cv2.LINE_AA)
-                text_y += line_h
+            lscale, lthick = 0.5, 1
+            (tw, th), _ = cv2.getTextSize(label, font, lscale, lthick)
+            lx, ly = bx1, max(by1 - (30 if is_primary else 4), th + 2)
+            cv2.rectangle(out, (lx, ly - th - 2), (lx + tw + 4, ly + 2), color, -1)
+            cv2.putText(out, label, (lx + 2, ly), font, lscale,
+                        (0, 0, 0), lthick + 1, cv2.LINE_AA)
+            cv2.putText(out, label, (lx + 2, ly), font, lscale,
+                        (255, 255, 255), lthick, cv2.LINE_AA)
 
+        # Blend silhouette overlay at 35% opacity
+        cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
         return out
 
     # ------------------------------------------------------------------
     # Render modes
     # ------------------------------------------------------------------
 
-    def _render_primary(self, frame, persons, shot_type, diagnostics: bool = False,
-                        settings: dict | None = None):
+    def _render_primary(self, frame, persons, shot_type, settings: dict | None = None):
         """Track the nearest (largest bbox) person as primary.
 
         Primary persistence:
@@ -501,17 +537,41 @@ class VideoThread(QThread):
         current_ids = {p.id for p in persons}
 
         # Initialise or recover if primary truly left the frame.
-        # Only stamp _primary_last_switch_time when we are forced to pick a
-        # different person — not on every frame the primary is briefly unseen.
+        # When the primary ID drops (ID churn / momentary occlusion), we silently
+        # reassign to the nearest person WITHOUT resetting the dwell clock — unless
+        # the new person is spatially far from the current camera position.  This
+        # prevents the rapid-recovery pattern from spamming dwell resets and
+        # causing constant panning when nobody is actually moving.
         if self._primary_id not in current_ids:
             new_primary = persons[0].id
             self._primary_id = new_primary
             self._primary_pending_id = None
             self._primary_pretraveling = False
             self._primary_fade_start = None
-            # Reset dwell only when forced to a genuinely different person,
-            # so the 1s gate fires correctly after recovery.
-            self._primary_last_switch_time = now
+
+            # Only reset the dwell clock if the camera needs to move significantly
+            # to cover the new primary.  "Significantly" = new person's center is
+            # more than 30% of the current crop width away from the camera center.
+            smoother_state = self._smoother.get_state('primary')
+            if smoother_state is not None:
+                crop_w = config.OUTPUT_WIDTH / max(smoother_state['zoom'], 0.01)
+                cam_cx = smoother_state['x'] + crop_w / 2.0
+                new_p = next((p for p in persons if p.id == new_primary), None)
+                if new_p is not None:
+                    new_cx = (new_p.bbox[0] + new_p.bbox[2]) / 2.0
+                    displacement = abs(new_cx - cam_cx)
+                    if displacement > crop_w * 0.30:
+                        self._primary_last_switch_time = now
+                        self._last_recovery_far = True
+                    else:
+                        self._last_recovery_far = False  # near/silent
+                else:
+                    self._last_recovery_far = False
+                # else: new person is close — silent reassignment, dwell clock untouched
+            else:
+                # No smoother state yet (very first frame) — reset is fine
+                self._primary_last_switch_time = now
+                self._last_recovery_far = True
 
         current_p = next((p for p in persons if p.id == self._primary_id), persons[0])
 
@@ -554,21 +614,18 @@ class VideoThread(QThread):
                     self._primary_last_switch_time = now
                 else:
                     self._primary_fade_start = now
-            src = self._annotate_frame(frame, persons, self._primary_id) if diagnostics else frame
             primary = next((p for p in persons if p.id == self._primary_id), persons[0])
             tx, ty, tz = self._framing.calculate_target(primary, shot_type)
             cx = (primary.bbox[0] + primary.bbox[2]) / 2.0
             cw = config.OUTPUT_WIDTH / tz
             sx, sy, sz = self._smoother.update('primary', tx, ty, tz,
                                                person_center_x=cx, crop_width=cw)
-            return self._framing.apply_crop(src, sx, sy, sz)
+            return self._framing.apply_crop(frame, sx, sy, sz)
 
         # --- Phase 2: crossfade to new primary ---
         if self._primary_pending_id is not None and self._primary_fade_start is not None:
             elapsed = now - self._primary_fade_start
             t = min(1.0, elapsed / max(xfade_dur, 0.001))
-
-            src = self._annotate_frame(frame, persons, self._primary_id) if diagnostics else frame
 
             primary = next((p for p in persons if p.id == self._primary_id), persons[0])
             atx, aty, atz = self._framing.calculate_target(primary, shot_type)
@@ -576,7 +633,7 @@ class VideoThread(QThread):
             cw_a = config.OUTPUT_WIDTH / atz
             ax, ay, az = self._smoother.update('primary', atx, aty, atz,
                                                person_center_x=cx_a, crop_width=cw_a)
-            frame_active = self._framing.apply_crop(src, ax, ay, az)
+            frame_active = self._framing.apply_crop(frame, ax, ay, az)
 
             pending_person = next((p for p in persons if p.id == self._primary_pending_id), None)
             if pending_person:
@@ -585,7 +642,7 @@ class VideoThread(QThread):
                 cw_p = config.OUTPUT_WIDTH / ptz
                 px, py, pz = self._smoother.update(self._primary_pending_id, ptx, pty, ptz,
                                                    person_center_x=cx_p, crop_width=cw_p)
-                frame_pending = self._framing.apply_crop(src, px, py, pz)
+                frame_pending = self._framing.apply_crop(frame, px, py, pz)
                 blended = cv2.addWeighted(frame_active, 1.0 - t, frame_pending, t, 0)
             else:
                 blended = frame_active
@@ -608,10 +665,9 @@ class VideoThread(QThread):
             'primary', tx, ty, tz,
             person_center_x=center_x, crop_width=crop_w
         )
-        src = self._annotate_frame(frame, persons, self._primary_id) if diagnostics else frame
-        return self._framing.apply_crop(src, sx, sy, sz)
+        return self._framing.apply_crop(frame, sx, sy, sz)
 
-    def _render_switcher(self, frame, persons, shot_type, diagnostics: bool = False):
+    def _render_switcher(self, frame, persons, shot_type):
         """Virtual switcher: cut or crossfade between tracked persons.
 
         When a switch is queued the pending person's smoother is advanced every
@@ -627,9 +683,6 @@ class VideoThread(QThread):
 
         active_id = self._switcher.decide(persons)
 
-        # Annotate input frame once; both active and pending crops share the same overlay
-        src = self._annotate_frame(frame, persons, active_id) if diagnostics else frame
-
         # Render active person
         active_person = next((p for p in persons if p.id == active_id), persons[0])
         atx, aty, atz = self._framing.calculate_target(active_person, shot_type)
@@ -639,7 +692,7 @@ class VideoThread(QThread):
             active_id, atx, aty, atz,
             person_center_x=cx_a, crop_width=cw_a
         )
-        frame_active = self._framing.apply_crop(src, ax, ay, az)
+        frame_active = self._framing.apply_crop(frame, ax, ay, az)
 
         # Pretravel: advance the pending smoother off-screen so it's settled
         # before the transition becomes visible; keep showing the active frame.
@@ -668,7 +721,7 @@ class VideoThread(QThread):
                     pending_id, ptx, pty, ptz,
                     person_center_x=cx_p, crop_width=cw_p
                 )
-                frame_pending = self._framing.apply_crop(src, px, py, pz)
+                frame_pending = self._framing.apply_crop(frame, px, py, pz)
                 return self._switcher.blend(frame_active, frame_pending), active_id
 
         return frame_active, active_id
@@ -692,7 +745,7 @@ class DiagnosticsWindow(QMainWindow):
     def __init__(self, show_overlays: bool = False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Autofollow Diagnostics")
-        self.setMinimumSize(540, 460)
+        self.setMinimumSize(640, 640)
         self._last_active_id: str | None = None   # for detecting new switch events
 
         root = QWidget()
@@ -711,6 +764,17 @@ class DiagnosticsWindow(QMainWindow):
         overlay_row.addStretch()
         layout.addLayout(overlay_row)
 
+        # ── Video preview (raw input with color-coded overlays) ──────────
+        self._video_label = QLabel()
+        self._video_label.setAlignment(Qt.AlignCenter)
+        self._video_label.setMinimumSize(320, 180)
+        self._video_label.setStyleSheet("background: #111; border: 1px solid #333;")
+        self._video_label.setSizePolicy(
+            self._video_label.sizePolicy().Expanding,
+            self._video_label.sizePolicy().Expanding,
+        )
+        layout.addWidget(self._video_label, stretch=3)
+
         # ── State summary row ────────────────────────────────────────────
         state_box = QGroupBox("Tracking State")
         state_grid = QHBoxLayout(state_box)
@@ -726,9 +790,9 @@ class DiagnosticsWindow(QMainWindow):
         # ── Per-person table ─────────────────────────────────────────────
         persons_box = QGroupBox("Tracked Persons")
         persons_layout = QVBoxLayout(persons_box)
-        self._table = QTableWidget(0, 8)
+        self._table = QTableWidget(0, 9)
         self._table.setHorizontalHeaderLabels(
-            ["ID", "FG(sm)", "Act(sm)", "FG Ratio", "Act Ratio", "Unseen", "Center X,Y", "Zoom(sm)"]
+            ["", "ID", "FG(sm)", "Act(sm)", "FG Ratio", "Act Ratio", "Unseen", "Center X,Y", "Zoom(sm)"]
         )
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -764,6 +828,17 @@ class DiagnosticsWindow(QMainWindow):
         row.addWidget(lbl)
         row.addWidget(val)
         return val
+
+    # ------------------------------------------------------------------
+
+    def update_video(self, qimg: QImage):
+        """Display a new annotated frame in the diagnostics video preview."""
+        if not self.isVisible():
+            return
+        pix = QPixmap.fromImage(qimg)
+        self._video_label.setPixmap(
+            pix.scaled(self._video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
 
     # ------------------------------------------------------------------
 
@@ -817,6 +892,7 @@ class DiagnosticsWindow(QMainWindow):
 
             # ── Per-person table ─────────────────────────────────────────
             self._table.setRowCount(len(persons))
+            person_index_map = meta.get('person_index_map', {})
             for row, p in enumerate(persons):
                 pid       = p['id']
                 fg        = p['fg_score']
@@ -834,6 +910,26 @@ class DiagnosticsWindow(QMainWindow):
                 fg_trigger  = fg_ratio >= 1.5 and gate_open and not is_active
                 act_trigger = act >= 5.0 and act_ratio >= 2.0 and gate_open and not is_active
 
+                # Person's skeleton color (matches the video overlay).
+                # _person_color uses OpenCV HSV hue 0-179 with step 137.5,
+                # Qt fromHsv uses 0-359, so multiply the same step by 2.
+                p_idx = person_index_map.get(pid, 0)
+                skel_qcolor = QColor.fromHsv(int((p_idx * 275) % 360), 200, 220)
+                swatch_bg = QColor(
+                    skel_qcolor.red()   // 4,
+                    skel_qcolor.green() // 4,
+                    skel_qcolor.blue()  // 4,
+                )
+
+                # Column 0: color swatch (solid person color, narrow)
+                swatch = QTableWidgetItem()
+                swatch.setBackground(skel_qcolor)
+                if is_active:
+                    swatch.setText("▶")
+                    swatch.setForeground(QColor(0, 0, 0))
+                swatch.setTextAlignment(Qt.AlignCenter)
+                self._table.setItem(row, 0, swatch)
+
                 cells = [
                     pid,
                     f"{fg:.4f}",
@@ -844,16 +940,25 @@ class DiagnosticsWindow(QMainWindow):
                     f"{cx:.0f},{cy:.0f}",
                     f"{sz:.2f}" if sz is not None else "—",
                 ]
-                for col, text in enumerate(cells):
+                for col, text in enumerate(cells, start=1):
                     item = QTableWidgetItem(text)
                     item.setTextAlignment(Qt.AlignCenter)
                     if is_active:
                         item.setBackground(QColor(40, 80, 40))
+                        item.setForeground(skel_qcolor)
                     elif is_pending:
                         item.setBackground(QColor(80, 60, 20))
+                        item.setForeground(skel_qcolor)
                     elif fg_trigger or act_trigger:
                         item.setBackground(QColor(80, 40, 40))
+                        item.setForeground(skel_qcolor)
+                    else:
+                        item.setBackground(swatch_bg)
+                        item.setForeground(skel_qcolor)
                     self._table.setItem(row, col, item)
+
+            # Fix swatch column to a narrow fixed width
+            self._table.setColumnWidth(0, 22)
 
         # ── Switch event log: append a line when active_id changes ───────
         if active_id != self._last_active_id and active_id not in ('none', 'disabled', None):
@@ -869,7 +974,11 @@ class DiagnosticsWindow(QMainWindow):
                     why.append(f"fg={fg_r:.2f}≥1.5")
                 if nearest['activity'] >= 5.0 and act_r >= 2.0:
                     why.append(f"act={act_r:.2f}≥2.0")
-                reason = f"  [{', '.join(why) if why else 'recovery'}]"
+                if not why:
+                    # Recovery: distinguish near (silent dwell) vs far (dwell reset)
+                    recovery_far = meta.get('last_recovery_far', True)
+                    why.append('recovery/far' if recovery_far else 'recovery/near')
+                reason = f"  [{', '.join(why)}]"
             line = (f"[{ts}]  {self._last_active_id or '—'} → {active_id}"
                     f"  dwell={dwell:.2f}s{reason}")
             self._log.append(line)
@@ -934,6 +1043,7 @@ class ControlWindow(QMainWindow):
         self._diag_win.overlays_changed.connect(self._on_diagnostics_changed)
         self._video_thread = VideoThread(self._state)
         self._video_thread.frame_ready.connect(self._on_frame)
+        self._video_thread.diag_frame_ready.connect(self._diag_win.update_video)
         self._video_thread.camera_info.connect(self._on_camera_info)
         self._video_thread.persons_updated.connect(self._on_persons_updated)
 
