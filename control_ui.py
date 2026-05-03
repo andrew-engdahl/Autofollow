@@ -157,13 +157,10 @@ class VideoThread(QThread):
         self._primary_pretraveling: bool = False
         self._primary_pretravel_start: float = 0.0
         self._primary_fade_start: float | None = None
-        self._primary_last_switch_time: float = time.monotonic()  # enforces 1s minimum dwell
-        self._last_recovery_far: bool = False  # True = recovery moved camera; False = near/silent
-        self._last_recovery_time: float = 0.0  # monotonic time of last recovery reassignment
-        # Wide-shot state: entered when no subjects detected
-        self._wide_shot_active: bool = False
-        self._wide_shot_fade_start: float | None = None   # None = cut already applied
-        self._wide_shot_reacquire_at: float = 0.0         # earliest time to leave wide-shot
+        self._primary_last_switch_time: float = time.monotonic()
+        # Search state: entered when primary ID is lost; camera holds position and
+        # slowly zooms out until the primary reappears.  No cut/crossfade occurs.
+        self._searching: bool = False
         # Disabled-mode transition state
         self._disabled_transitioning: bool = False
         self._disabled_transition_start: float | None = None
@@ -361,7 +358,7 @@ class VideoThread(QThread):
             'dwell_threshold': 3.0,
             'mode': mode,
             'smoother_primary': self._smoother.get_state('primary'),
-            'last_recovery_far': self._last_recovery_far,
+            'searching': self._searching,
             'person_index_map': dict(self._person_index_map),
         }
         return _bgr_to_qimage(output_frame), meta
@@ -504,109 +501,45 @@ class VideoThread(QThread):
 
         from switcher import _PRETRAVEL_DURATION
 
-        # ----------------------------------------------------------------
-        # Wide-shot fade-in/hold (no subjects detected, or hold period active)
-        # ----------------------------------------------------------------
-        wide_target_x, wide_target_y, wide_target_z = self._framing._default_target()
-
-        entering_wide = not persons and not self._wide_shot_active
-        if entering_wide:
-            self._wide_shot_active = True
-            self._primary_id = None
-            self._primary_pending_id = None
-            self._primary_pretraveling = False
-            self._primary_fade_start = None
-            if sw_mode == 'crossfade':
-                self._wide_shot_fade_start = now
-            else:
-                self._wide_shot_fade_start = None  # immediate cut
-
-        if self._wide_shot_active:
-            # Set earliest re-acquire time whenever we (re-)enter wide-shot
-            if entering_wide:
-                self._wide_shot_reacquire_at = now + xfade_dur
-
-            # Crossfade into the wide shot
-            if self._wide_shot_fade_start is not None:
-                elapsed = now - self._wide_shot_fade_start
-                t = min(1.0, elapsed / max(xfade_dur, 0.001))
-                # Advance the wide-shot smoother
-                wx, wy, wz = self._smoother.update('__wide__', wide_target_x, wide_target_y, wide_target_z)
-                frame_wide = self._framing.apply_crop(frame, wx, wy, wz)
-                if t >= 1.0:
-                    self._wide_shot_fade_start = None  # fade complete
-                    if persons:
-                        # Subject appeared during fade — check hold
-                        if now >= self._wide_shot_reacquire_at:
-                            self._wide_shot_active = False
-                    return frame_wide
-                # Still fading: blend from wherever the primary smoother is
-                px, py, pz = self._smoother.update('primary', wide_target_x, wide_target_y, wide_target_z)
-                frame_from = self._framing.apply_crop(frame, px, py, pz)
-                return cv2.addWeighted(frame_from, 1.0 - t, frame_wide, t, 0)
-
-            # Wide-shot is fully active (fade done)
-            wx, wy, wz = self._smoother.update('__wide__', wide_target_x, wide_target_y, wide_target_z)
-            frame_wide = self._framing.apply_crop(frame, wx, wy, wz)
-
-            if persons and now >= self._wide_shot_reacquire_at:
-                # Hold period elapsed — leave wide-shot and fall through to normal tracking
-                self._wide_shot_active = False
-            else:
-                # Still in hold or no subjects; keep extending the reacquire deadline
-                if not persons:
-                    self._wide_shot_reacquire_at = now + xfade_dur
-                return frame_wide
+        # How fast to zoom out each frame while searching (zoom units/frame).
+        # At 30fps this reaches _MIN_ZOOM=0.5 from zoom=3 in ~83 frames (~2.8s).
+        _SEARCH_ZOOM_OUT_RATE = 0.008
 
         # ----------------------------------------------------------------
-        # Normal subject tracking
+        # Search mode: primary lost — hold pan/tilt, zoom out slowly
         # ----------------------------------------------------------------
         current_ids = {p.id for p in persons}
 
-        # Initialise or recover if primary truly left the frame.
-        # When the primary ID drops (ID churn / momentary occlusion), we silently
-        # reassign to the nearest person WITHOUT resetting the dwell clock — unless
-        # the new person is spatially far from the current camera position.  This
-        # prevents the rapid-recovery pattern from spamming dwell resets and
-        # causing constant panning when nobody is actually moving.
-        #
-        # Recovery cooldown: after a recovery reassignment, ignore further ID drops
-        # for _RECOVERY_COOLDOWN seconds.  This prevents ID churn from producing a
-        # chain of rapid-fire panning recoveries.
-        _RECOVERY_COOLDOWN = 3.0  # seconds to suppress further recovery reassignments
-        if self._primary_id not in current_ids:
-            cooldown_active = (now - self._last_recovery_time) < _RECOVERY_COOLDOWN
-            if not cooldown_active:
-                new_primary = persons[0].id
-                self._primary_id = new_primary
+        primary_present = self._primary_id is not None and self._primary_id in current_ids
+
+        if not primary_present:
+            # Enter search if not already in it
+            if not self._searching:
+                self._searching = True
                 self._primary_pending_id = None
                 self._primary_pretraveling = False
                 self._primary_fade_start = None
-                self._last_recovery_time = now
 
-                # Only reset the dwell clock if the camera needs to move significantly
-                # to cover the new primary.  "Significantly" = new person's center is
-                # more than 30% of the current crop width away from the camera center.
-                smoother_state = self._smoother.get_state('primary')
-                if smoother_state is not None:
-                    crop_w = config.OUTPUT_WIDTH / max(smoother_state['zoom'], 0.01)
-                    cam_cx = smoother_state['x'] + crop_w / 2.0
-                    new_p = next((p for p in persons if p.id == new_primary), None)
-                    if new_p is not None:
-                        new_cx = (new_p.bbox[0] + new_p.bbox[2]) / 2.0
-                        displacement = abs(new_cx - cam_cx)
-                        if displacement > crop_w * 0.30:
-                            self._primary_last_switch_time = now
-                            self._last_recovery_far = True
-                        else:
-                            self._last_recovery_far = False  # near/silent
-                    else:
-                        self._last_recovery_far = False
+            # Try to adopt the first available person as primary once we have one
+            if persons and self._primary_id is None:
+                self._primary_id = persons[0].id
+                self._primary_last_switch_time = now
+                self._searching = False
+            else:
+                # Hold current position; nudge zoom out toward _MIN_ZOOM
+                state = self._smoother.get_state('primary')
+                if state is not None:
+                    from framing_engine import _MIN_ZOOM
+                    state['zoom'] = max(_MIN_ZOOM, state['zoom'] - _SEARCH_ZOOM_OUT_RATE)
+                    return self._framing.apply_crop(frame, state['x'], state['y'], state['zoom'])
                 else:
-                    # No smoother state yet (very first frame) — reset is fine
-                    self._primary_last_switch_time = now
-                    self._last_recovery_far = True
-            # else: cooldown active — hold current smoother position, skip reassignment
+                    # No smoother state yet — nothing to show
+                    return frame
+
+        # Primary reappeared — exit search mode
+        if self._searching:
+            self._searching = False
+            self._primary_last_switch_time = now
 
         current_p = next((p for p in persons if p.id == self._primary_id), persons[0])
 
@@ -896,6 +829,8 @@ class DiagnosticsWindow(QMainWindow):
         # Phase string
         if meta.get('mode') == 'disabled':
             phase = 'disabled'
+        elif meta.get('searching'):
+            phase = 'searching'
         elif pretrav:
             phase = 'pretravel'
         elif pending_id:
@@ -1010,9 +945,7 @@ class DiagnosticsWindow(QMainWindow):
                 if nearest['activity'] >= 5.0 and act_r >= 2.0:
                     why.append(f"act={act_r:.2f}≥2.0")
                 if not why:
-                    # Recovery: distinguish near (silent dwell) vs far (dwell reset)
-                    recovery_far = meta.get('last_recovery_far', True)
-                    why.append('recovery/far' if recovery_far else 'recovery/near')
+                    why.append('reacquired')
                 reason = f"  [{', '.join(why)}]"
             line = (f"[{ts}]  {self._last_active_id or '—'} → {active_id}"
                     f"  dwell={dwell:.2f}s{reason}")

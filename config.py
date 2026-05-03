@@ -13,7 +13,7 @@ DETECTION_INTERVAL = 1            # Run pose detection every N frames (1 = every
 MAX_PERSONS = 12                  # Maximum simultaneous tracked people
 
 # Framing
-PADDING_RATIO = 0.15              # Padding around detected person bounding box
+PADDING_RATIO = 0.25              # Padding around detected person bounding box
 SHOT_TYPE = 'waist_up'            # 'full_body' | 'waist_up' | 'medium' | 'close_up'
 MAX_ZOOM = 4.0                    # Maximum zoom factor
 DEADZONE = 0.4                    # Horizontal deadzone (0–1): fraction of viewport where subject moves without panning
