@@ -1,0 +1,22 @@
+#!/bin/bash
+# Autofollow.app — macOS application bundle launcher.
+# The bundle lives at <project>/Autofollow.app, so Contents/MacOS is
+# three levels below the project root.
+
+MACOS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_DIR="$( cd "$MACOS_DIR/../../.." && pwd )"
+
+VENV="$PROJECT_DIR/.venv/bin/python3"
+MAIN="$PROJECT_DIR/main.py"
+
+if [ ! -f "$VENV" ]; then
+    osascript -e "display alert \"Autofollow\" message \"Virtual environment not found.\n\nExpected:\n$VENV\n\nRun setup.sh first.\" as critical"
+    exit 1
+fi
+
+if [ ! -f "$MAIN" ]; then
+    osascript -e "display alert \"Autofollow\" message \"Could not find main.py at:\n$MAIN\" as critical"
+    exit 1
+fi
+
+exec "$VENV" "$MAIN"
