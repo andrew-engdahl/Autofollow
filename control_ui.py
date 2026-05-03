@@ -77,6 +77,7 @@ class AppState:
         self.camera_change_requested: bool = False
         self.show_diagnostics: bool = config.SHOW_DIAGNOSTICS
         self.auto_follow_enabled: bool = True
+        self.foreground_exclusion_y: float = config.FOREGROUND_EXCLUSION_Y
 
     def read(self):
         """Return a snapshot of current settings (thread-safe)."""
@@ -93,6 +94,7 @@ class AppState:
                 'camera_change_requested': self.camera_change_requested,
                 'show_diagnostics': self.show_diagnostics,
                 'auto_follow_enabled': self.auto_follow_enabled,
+                'foreground_exclusion_y': self.foreground_exclusion_y,
             }
 
     def consume_manual_switch(self) -> str | None:
@@ -214,7 +216,8 @@ class VideoThread(QThread):
         else:
             detections = []
 
-        persons = self._tracker.update(detections, frame.shape)
+        persons = self._tracker.update(detections, frame.shape,
+                                       foreground_exclusion_y=settings.get('foreground_exclusion_y', 0.0))
 
         # Sync switcher settings from UI state
         self._switcher.switch_mode = settings['switch_mode']
@@ -529,6 +532,13 @@ class VideoThread(QThread):
         frame (pretravel phase) so the virtual camera has already arrived at the
         new subject's position by the time the cut or crossfade fires.
         """
+        # Give the switcher the current crop width so it can gate switches by displacement.
+        if self._switcher.active_id:
+            current_person = next((p for p in persons if p.id == self._switcher.active_id), None)
+            if current_person:
+                _, _, cur_zoom = self._framing.calculate_target(current_person, shot_type)
+                self._switcher.current_crop_width = config.OUTPUT_WIDTH / cur_zoom
+
         active_id = self._switcher.decide(persons)
 
         # Annotate input frame once; both active and pending crops share the same overlay
@@ -812,6 +822,23 @@ class ControlWindow(QMainWindow):
         diag_row.addStretch()
         layout.addLayout(diag_row)
 
+        # Foreground exclusion zone slider
+        excl_row = QHBoxLayout()
+        excl_row.addWidget(QLabel("Audience Exclusion:"))
+        self._excl_slider = QSlider(Qt.Horizontal)
+        self._excl_slider.setRange(0, 100)
+        self._excl_slider.setValue(int(self._state.foreground_exclusion_y * 100))
+        self._excl_slider.setToolTip(
+            "Ignore detections in the bottom N% of the frame (foreground audience filter).\n"
+            "0 = disabled. Increase until stage-front audience members are no longer tracked."
+        )
+        self._excl_value_label = QLabel(f"{int(self._state.foreground_exclusion_y * 100)}%")
+        self._excl_value_label.setFixedWidth(32)
+        self._excl_slider.valueChanged.connect(self._on_exclusion_changed)
+        excl_row.addWidget(self._excl_slider)
+        excl_row.addWidget(self._excl_value_label)
+        layout.addLayout(excl_row)
+
         return box
 
     # --- Status bar ---
@@ -918,6 +945,11 @@ class ControlWindow(QMainWindow):
     def _on_diagnostics_changed(self, state: int):
         with QMutexLocker(self._state._lock):
             self._state.show_diagnostics = bool(state)
+
+    def _on_exclusion_changed(self, value: int):
+        self._excl_value_label.setText(f"{value}%")
+        with QMutexLocker(self._state._lock):
+            self._state.foreground_exclusion_y = value / 100.0
 
     def _open_fullscreen(self):
         screen_index = self._display_combo.currentData()

@@ -54,6 +54,19 @@ SWITCH_TRIGGER = 'time'           # 'time' | 'activity' | 'manual'
 SWITCH_INTERVAL = 8.0             # Seconds between auto-switches (time trigger)
 CROSSFADE_DURATION = 1.0          # Seconds for crossfade transition
 
+# Foreground audience exclusion
+# Detections whose bbox bottom-edge is in the lower FOREGROUND_EXCLUSION_Y fraction
+# of the frame (0.0 = disabled, 1.0 = exclude everything).  Audience members standing
+# in front of the stage are typically in the lower portion of the frame; performers on
+# stage are higher up.  Set to 0.0 to disable.
+FOREGROUND_EXCLUSION_Y = 0.0      # fraction of frame height from bottom to ignore
+
+# Virtual switcher displacement gate
+# A subject switch is only triggered when the new subject's center is at least this
+# fraction of the current crop width away from the current shot center.
+# 0.0 = switch on any candidate; 0.75 = require significant displacement before switching.
+SWITCHER_MIN_DISPLACEMENT_RATIO = 0.75
+
 # UI
 SHOW_OVERLAY = False              # Show frame info overlay text
 SHOW_DIAGNOSTICS = False          # Overlay pose skeleton and per-person tracking circles

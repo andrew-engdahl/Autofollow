@@ -2,7 +2,7 @@
 
 import numpy as np
 from dataclasses import dataclass, field
-from config import MAX_PERSONS
+from config import MAX_PERSONS, FOREGROUND_EXCLUSION_Y as _DEFAULT_EXCLUSION_Y
 
 _DROPOUT_FRAMES = 10   # drop a track after this many consecutive unmatched frames
 _IOU_THRESHOLD = 0.3   # minimum IoU to match a detection to an existing track
@@ -52,7 +52,8 @@ class PersonTracker:
         self._next_index = 1                           # for assigning 'person1', 'person2', …
         self._frame_area = 1.0
 
-    def update(self, detections: list[dict], frame_shape: tuple) -> list[TrackedPerson]:
+    def update(self, detections: list[dict], frame_shape: tuple,
+               foreground_exclusion_y: float | None = None) -> list[TrackedPerson]:
         """Match new detections to existing tracks; assign stable IDs.
 
         Args:
@@ -64,6 +65,14 @@ class PersonTracker:
         """
         fh, fw = frame_shape[:2]
         self._frame_area = max(1.0, float(fw * fh))
+
+        # Drop detections whose bottom edge falls in the foreground exclusion zone.
+        # Audience members standing in front of the stage appear in the lower part of
+        # the frame; performers on stage are higher up.
+        excl = foreground_exclusion_y if foreground_exclusion_y is not None else _DEFAULT_EXCLUSION_Y
+        if excl > 0.0:
+            exclusion_threshold = fh * (1.0 - excl)
+            detections = [d for d in detections if d['bbox'][3] <= exclusion_threshold]
 
         # Increment unseen counter for all existing tracks
         for t in self._tracks.values():

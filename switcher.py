@@ -4,7 +4,7 @@ import time
 import cv2
 import numpy as np
 from tracker import TrackedPerson
-from config import SWITCH_MODE, SWITCH_TRIGGER, SWITCH_INTERVAL, CROSSFADE_DURATION
+from config import SWITCH_MODE, SWITCH_TRIGGER, SWITCH_INTERVAL, CROSSFADE_DURATION, SWITCHER_MIN_DISPLACEMENT_RATIO
 
 # Seconds to warm up the pending person's smoother before committing to the transition.
 # This gives the virtual camera time to travel to the new subject's position so the
@@ -45,6 +45,7 @@ class VirtualSwitcher:
         self._fade_start: float | None = None  # time.monotonic() when crossfade began
         self._last_switch_time: float = time.monotonic()
         self._manual_request: str | None = None
+        self.current_crop_width: float = 0.0  # set by caller each frame for displacement gating
 
     # ------------------------------------------------------------------
     # Public API
@@ -116,10 +117,12 @@ class VirtualSwitcher:
 
         # Determine target
         target = None
+        is_manual = False
 
         if self._manual_request is not None:
             if self._manual_request in ids and self._manual_request != self.active_id:
                 target = self._manual_request
+                is_manual = True
             self._manual_request = None
 
         if target is None and self.trigger == 'time':
@@ -143,6 +146,19 @@ class VirtualSwitcher:
                     if (most_active.activity_score >= 12.0
                             and most_active.activity_score > current_score * 2.0):
                         target = most_active.id
+
+        if target is not None and not is_manual:
+            # Only auto-switch if the candidate is significantly displaced from the
+            # current shot center — prevents flickering between nearby subjects.
+            if SWITCHER_MIN_DISPLACEMENT_RATIO > 0.0 and self.current_crop_width > 0.0:
+                active_person = next((p for p in persons if p.id == self.active_id), None)
+                candidate_person = next((p for p in persons if p.id == target), None)
+                if active_person and candidate_person:
+                    active_cx = (active_person.bbox[0] + active_person.bbox[2]) / 2.0
+                    candidate_cx = (candidate_person.bbox[0] + candidate_person.bbox[2]) / 2.0
+                    displacement = abs(candidate_cx - active_cx)
+                    if displacement < self.current_crop_width * SWITCHER_MIN_DISPLACEMENT_RATIO:
+                        target = None  # too close — skip this switch
 
         if target is not None:
             self._initiate_switch(target, now)
