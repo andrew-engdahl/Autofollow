@@ -10,7 +10,7 @@ CONFIDENCE_THRESHOLD = 0.5
 YOLO_MODEL = 'yolov8n-pose.pt'    # nano=n, small=s, medium=m, large=l
 DETECTION_SCALE = 0.5             # Run YOLO on this fraction of input resolution (0.25–1.0)
 DETECTION_INTERVAL = 1            # Run pose detection every N frames (1 = every frame)
-MAX_PERSONS = 5                   # Maximum simultaneous tracked people
+MAX_PERSONS = 12                  # Maximum simultaneous tracked people
 
 # Framing
 PADDING_RATIO = 0.15              # Padding around detected person bounding box

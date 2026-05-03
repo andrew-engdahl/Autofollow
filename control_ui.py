@@ -9,10 +9,11 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QRadioButton, QButtonGroup,
-    QGroupBox, QDoubleSpinBox, QSlider, QSizePolicy, QFrame, QCheckBox,
+    QGroupBox, QDoubleSpinBox, QSpinBox, QSlider, QCheckBox,
+    QTableWidget, QTableWidgetItem, QTextEdit, QHeaderView,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker
-from PyQt5.QtGui import QImage, QPixmap, QFont
+from PyQt5.QtGui import QImage, QPixmap, QFont, QColor
 
 import config
 from pose_detector import PoseDetector
@@ -78,6 +79,7 @@ class AppState:
         self.show_diagnostics: bool = config.SHOW_DIAGNOSTICS
         self.auto_follow_enabled: bool = True
         self.foreground_exclusion_y: float = config.FOREGROUND_EXCLUSION_Y
+        self.max_persons: int = config.MAX_PERSONS
 
     def read(self):
         """Return a snapshot of current settings (thread-safe)."""
@@ -95,6 +97,7 @@ class AppState:
                 'show_diagnostics': self.show_diagnostics,
                 'auto_follow_enabled': self.auto_follow_enabled,
                 'foreground_exclusion_y': self.foreground_exclusion_y,
+                'max_persons': self.max_persons,
             }
 
     def consume_manual_switch(self) -> str | None:
@@ -141,7 +144,7 @@ class VideoThread(QThread):
         self._primary_pretraveling: bool = False
         self._primary_pretravel_start: float = 0.0
         self._primary_fade_start: float | None = None
-        self._primary_last_switch_time: float = 0.0      # enforces 1s minimum dwell
+        self._primary_last_switch_time: float = time.monotonic()  # enforces 1s minimum dwell
         # Wide-shot state: entered when no subjects detected
         self._wide_shot_active: bool = False
         self._wide_shot_fade_start: float | None = None   # None = cut already applied
@@ -221,7 +224,8 @@ class VideoThread(QThread):
             detections = []
 
         persons = self._tracker.update(detections, frame.shape,
-                                       foreground_exclusion_y=settings.get('foreground_exclusion_y', 0.0))
+                                       foreground_exclusion_y=settings.get('foreground_exclusion_y', 0.0),
+                                       max_persons=settings.get('max_persons', config.MAX_PERSONS))
 
         # Sync switcher settings from UI state
         self._switcher.switch_mode = settings['switch_mode']
@@ -294,10 +298,26 @@ class VideoThread(QThread):
         elapsed = time.monotonic() - t0
         fps = 1.0 / elapsed if elapsed > 0 else 0.0
 
+        # Build per-person diagnostics list for the diagnostics panel
+        persons_diag = []
+        for p in persons:
+            persons_diag.append({
+                'id': p.id,
+                'fg_score': p.foreground_score,
+                'activity': p.activity_score,
+                'bbox': p.bbox,
+            })
+
         meta = {
             'fps': fps,
             'n_persons': len(persons),
             'active_id': active_id,
+            'persons': persons_diag,
+            'primary_id': self._primary_id,
+            'pending_id': self._primary_pending_id,
+            'pretraveling': self._primary_pretraveling,
+            'dwell_elapsed': time.monotonic() - self._primary_last_switch_time,
+            'mode': mode,
         }
         return _bgr_to_qimage(output_frame), meta
 
@@ -470,12 +490,17 @@ class VideoThread(QThread):
         # ----------------------------------------------------------------
         current_ids = {p.id for p in persons}
 
-        # Initialise or recover if primary left the frame
+        # Initialise or recover if primary truly left the frame.
+        # Only stamp _primary_last_switch_time when we are forced to pick a
+        # different person — not on every frame the primary is briefly unseen.
         if self._primary_id not in current_ids:
-            self._primary_id = persons[0].id
+            new_primary = persons[0].id
+            self._primary_id = new_primary
             self._primary_pending_id = None
             self._primary_pretraveling = False
             self._primary_fade_start = None
+            # Reset dwell only when forced to a genuinely different person,
+            # so the 1s gate fires correctly after recovery.
             self._primary_last_switch_time = now
 
         current_p = next((p for p in persons if p.id == self._primary_id), persons[0])
@@ -635,6 +660,192 @@ class VideoThread(QThread):
 
 
 # ---------------------------------------------------------------------------
+# Diagnostics panel
+# ---------------------------------------------------------------------------
+
+_LOG_MAX_LINES = 200   # keep last N switch events in the log
+
+
+class DiagnosticsWindow(QMainWindow):
+    """Floating panel showing live tracking state and a switch-event log.
+
+    Updated every frame via update_diagnostics(); never touches the video thread.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Autofollow Diagnostics")
+        self.setMinimumSize(540, 460)
+        self._last_active_id: str | None = None   # for detecting new switch events
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+        layout.setSpacing(6)
+
+        # ── State summary row ────────────────────────────────────────────
+        state_box = QGroupBox("Tracking State")
+        state_grid = QHBoxLayout(state_box)
+
+        self._lbl_mode     = self._make_field("Mode", state_grid)
+        self._lbl_active   = self._make_field("Active", state_grid)
+        self._lbl_pending  = self._make_field("Pending", state_grid)
+        self._lbl_phase    = self._make_field("Phase", state_grid)
+        self._lbl_dwell    = self._make_field("Dwell", state_grid)
+        self._lbl_fps      = self._make_field("FPS", state_grid)
+        layout.addWidget(state_box)
+
+        # ── Per-person table ─────────────────────────────────────────────
+        persons_box = QGroupBox("Tracked Persons")
+        persons_layout = QVBoxLayout(persons_box)
+        self._table = QTableWidget(0, 6)
+        self._table.setHorizontalHeaderLabels(
+            ["ID", "FG Score", "Activity", "FG Ratio", "Act Ratio", "BBox"]
+        )
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._table.setSelectionMode(QTableWidget.NoSelection)
+        self._table.setFixedHeight(130)
+        persons_layout.addWidget(self._table)
+        layout.addWidget(persons_box)
+
+        # ── Switch event log ─────────────────────────────────────────────
+        log_box = QGroupBox("Switch Event Log")
+        log_layout = QVBoxLayout(log_box)
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setFont(QFont("Courier", 10))
+        self._log.setStyleSheet("background:#1e1e1e; color:#d4d4d4;")
+        log_layout.addWidget(self._log)
+
+        btn_clear = QPushButton("Clear Log")
+        btn_clear.setFixedWidth(90)
+        btn_clear.clicked.connect(self._log.clear)
+        log_layout.addWidget(btn_clear, alignment=Qt.AlignRight)
+        layout.addWidget(log_box)
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_field(label: str, row: QHBoxLayout) -> QLabel:
+        """Add a label+value pair to a horizontal layout; return the value label."""
+        lbl = QLabel(f"{label}:")
+        lbl.setStyleSheet("font-weight: bold;")
+        val = QLabel("—")
+        val.setMinimumWidth(70)
+        row.addWidget(lbl)
+        row.addWidget(val)
+        return val
+
+    # ------------------------------------------------------------------
+
+    def update_diagnostics(self, meta: dict):
+        """Called from the UI thread every frame with the metadata dict.
+
+        Always processes the switch-event log (so history is captured even
+        when the window is hidden). Skips the table and label updates when
+        the window is not visible to avoid wasted work.
+        """
+        mode       = meta.get('mode', '?')
+        active_id  = meta.get('active_id', '?')
+        primary_id = meta.get('primary_id') or active_id
+        pending_id = meta.get('pending_id')
+        pretrav    = meta.get('pretraveling', False)
+        dwell      = meta.get('dwell_elapsed', 0.0)
+        fps        = meta.get('fps', 0.0)
+        persons    = meta.get('persons', [])
+
+        # Phase string
+        if meta.get('mode') == 'disabled':
+            phase = 'disabled'
+        elif pretrav:
+            phase = 'pretravel'
+        elif pending_id:
+            phase = 'crossfade'
+        else:
+            phase = 'steady'
+
+        # ── Per-person scores (needed for log too) ───────────────────────
+        current_p = next((p for p in persons if p['id'] == primary_id), None)
+        curr_fg  = current_p['fg_score'] if current_p else 1e-6
+        curr_act = current_p['activity'] if current_p else 1e-6
+
+        if self.isVisible():
+            self._lbl_mode.setText(mode)
+            self._lbl_active.setText(primary_id or '—')
+            self._lbl_pending.setText(pending_id or '—')
+            self._lbl_phase.setText(phase)
+            self._lbl_dwell.setText(f"{dwell:.2f}s")
+            self._lbl_fps.setText(f"{fps:.1f}")
+
+            # Colour the dwell label red when < 1s (gate not yet open)
+            if dwell < 1.0:
+                self._lbl_dwell.setStyleSheet("color: #e06c75; font-weight: bold;")
+            else:
+                self._lbl_dwell.setStyleSheet("color: #98c379; font-weight: bold;")
+
+            # ── Per-person table ─────────────────────────────────────────
+            self._table.setRowCount(len(persons))
+            for row, p in enumerate(persons):
+                pid       = p['id']
+                fg        = p['fg_score']
+                act       = p['activity']
+                fg_ratio  = fg  / max(curr_fg,  1e-6)
+                act_ratio = act / max(curr_act, 1e-6)
+                x1, y1, x2, y2 = p['bbox']
+
+                is_active  = pid == primary_id
+                is_pending = pid == pending_id
+
+                cells = [
+                    pid,
+                    f"{fg:.4f}",
+                    f"{act:.2f}",
+                    f"{fg_ratio:.2f}",
+                    f"{act_ratio:.2f}",
+                    f"{x1},{y1}→{x2},{y2}",
+                ]
+                for col, text in enumerate(cells):
+                    item = QTableWidgetItem(text)
+                    item.setTextAlignment(Qt.AlignCenter)
+                    if is_active:
+                        item.setBackground(QColor(40, 80, 40))
+                    elif is_pending:
+                        item.setBackground(QColor(80, 60, 20))
+                    self._table.setItem(row, col, item)
+
+        # ── Switch event log: append a line when active_id changes ───────
+        if active_id != self._last_active_id and active_id not in ('none', 'disabled', None):
+            ts = time.strftime("%H:%M:%S")
+            reason = ''
+            if persons and current_p:
+                nearest = persons[0]
+                if nearest['id'] != primary_id:
+                    fg_r  = nearest['fg_score']  / max(curr_fg,  1e-6)
+                    act_r = nearest['activity']  / max(curr_act, 1e-6)
+                    reason = f"  [fg_r={fg_r:.2f} act_r={act_r:.2f}]"
+            line = (f"[{ts}]  {self._last_active_id or '—'} → {active_id}"
+                    f"  dwell={dwell:.2f}s{reason}")
+            self._log.append(line)
+            # Trim to max lines
+            doc = self._log.document()
+            while doc.blockCount() > _LOG_MAX_LINES:
+                cursor = self._log.textCursor()
+                cursor.movePosition(cursor.Start)
+                cursor.select(cursor.BlockUnderCursor)
+                cursor.removeSelectedText()
+                cursor.deleteChar()   # remove the trailing newline
+            self._log.ensureCursorVisible()
+        self._last_active_id = active_id
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Escape, Qt.Key_Q):
+            self.hide()
+
+
+# ---------------------------------------------------------------------------
 # Fullscreen output window
 # ---------------------------------------------------------------------------
 
@@ -675,6 +886,7 @@ class ControlWindow(QMainWindow):
 
         self._state = AppState()
         self._output_win = OutputWindow()
+        self._diag_win = DiagnosticsWindow()
         self._video_thread = VideoThread(self._state)
         self._video_thread.frame_ready.connect(self._on_frame)
         self._video_thread.camera_info.connect(self._on_camera_info)
@@ -859,15 +1071,10 @@ class ControlWindow(QMainWindow):
         btn_fullscreen = QPushButton("Open Fullscreen Output")
         btn_fullscreen.clicked.connect(self._open_fullscreen)
         btn_row.addWidget(btn_fullscreen)
+        btn_diag = QPushButton("Open Diagnostics")
+        btn_diag.clicked.connect(self._open_diagnostics)
+        btn_row.addWidget(btn_diag)
         layout.addLayout(btn_row)
-
-        diag_row = QHBoxLayout()
-        self._diag_checkbox = QCheckBox("Show Diagnostics")
-        self._diag_checkbox.setChecked(self._state.show_diagnostics)
-        self._diag_checkbox.stateChanged.connect(self._on_diagnostics_changed)
-        diag_row.addWidget(self._diag_checkbox)
-        diag_row.addStretch()
-        layout.addLayout(diag_row)
 
         # Foreground exclusion zone slider
         excl_row = QHBoxLayout()
@@ -885,6 +1092,21 @@ class ControlWindow(QMainWindow):
         excl_row.addWidget(self._excl_slider)
         excl_row.addWidget(self._excl_value_label)
         layout.addLayout(excl_row)
+
+        # Max tracked persons spinbox
+        mp_row = QHBoxLayout()
+        mp_row.addWidget(QLabel("Max Tracked Persons:"))
+        self._max_persons_spin = QSpinBox()
+        self._max_persons_spin.setRange(1, 30)
+        self._max_persons_spin.setValue(self._state.max_persons)
+        self._max_persons_spin.setToolTip(
+            "Maximum number of people tracked simultaneously.\n"
+            "Higher values let the switcher follow more performers but use more CPU."
+        )
+        self._max_persons_spin.valueChanged.connect(self._on_max_persons_changed)
+        mp_row.addWidget(self._max_persons_spin)
+        mp_row.addStretch()
+        layout.addLayout(mp_row)
 
         return box
 
@@ -908,6 +1130,9 @@ class ControlWindow(QMainWindow):
         # Update fullscreen output if open
         if self._output_win.isVisible():
             self._output_win.update_frame(qimg)
+        # Always feed the diagnostics panel so the log captures events even when hidden.
+        # update_diagnostics() skips the table rebuild when the window is not visible.
+        self._diag_win.update_diagnostics(meta)
         # Status bar
         self._status_label.setText(
             f"FPS: {meta['fps']:.1f}  |  "
@@ -998,6 +1223,10 @@ class ControlWindow(QMainWindow):
         with QMutexLocker(self._state._lock):
             self._state.foreground_exclusion_y = value / 100.0
 
+    def _on_max_persons_changed(self, value: int):
+        with QMutexLocker(self._state._lock):
+            self._state.max_persons = value
+
     def _open_fullscreen(self):
         screen_index = self._display_combo.currentData()
         screens = QApplication.screens()
@@ -1007,9 +1236,14 @@ class ControlWindow(QMainWindow):
         self._output_win.showFullScreen()
         self._output_win.raise_()
 
+    def _open_diagnostics(self):
+        self._diag_win.show()
+        self._diag_win.raise_()
+
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
         self._video_thread.stop()
         self._output_win.close()
+        self._diag_win.close()
         event.accept()

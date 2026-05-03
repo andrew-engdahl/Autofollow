@@ -4,12 +4,16 @@ import numpy as np
 from dataclasses import dataclass, field
 from config import MAX_PERSONS, FOREGROUND_EXCLUSION_Y as _DEFAULT_EXCLUSION_Y
 
-_DROPOUT_FRAMES = 10   # drop a track after this many consecutive unmatched frames
-_IOU_THRESHOLD = 0.3   # minimum IoU to match a detection to an existing track
-_BBOX_ALPHA = 0.35     # bbox smoothing: fraction of new detection blended each frame
+_DROPOUT_FRAMES = 30    # drop a track after this many consecutive unmatched frames (~1s at 30fps)
+_IOU_THRESHOLD = 0.15   # minimum IoU to match; lowered to tolerate fast movement
+_BBOX_ALPHA = 0.5       # bbox smoothing: higher = follows detection more closely (less lag)
 _ACTIVITY_EMA_ALPHA = 0.3   # EMA smoothing for activity score — damps single-frame spikes
 _ACTIVITY_DX_WEIGHT = 2.0   # horizontal displacement weight (heavier — indicates engagement)
 _ACTIVITY_DY_WEIGHT = 1.0   # vertical displacement weight
+
+# Center-distance fallback matching: if IoU is too low (person moved fast), accept a
+# match when the detection center is within this fraction of the frame's diagonal.
+_CENTER_DIST_FALLBACK = 0.15   # fraction of frame diagonal (~0.15 = generous for fast movers)
 
 
 @dataclass
@@ -56,7 +60,8 @@ class PersonTracker:
         self._frame_area = 1.0
 
     def update(self, detections: list[dict], frame_shape: tuple,
-               foreground_exclusion_y: float | None = None) -> list[TrackedPerson]:
+               foreground_exclusion_y: float | None = None,
+               max_persons: int | None = None) -> list[TrackedPerson]:
         """Match new detections to existing tracks; assign stable IDs.
 
         Args:
@@ -81,7 +86,12 @@ class PersonTracker:
         for t in self._tracks.values():
             t.frames_unseen += 1
 
-        # Greedy IoU matching: pair each detection with the best matching track
+        # Greedy matching: IoU first, center-distance fallback for fast movers.
+        # The fallback prevents ID churn when a person moves quickly enough that
+        # their new detection has little overlap with their previous bbox.
+        frame_diag = (fh ** 2 + fw ** 2) ** 0.5
+        max_center_dist = frame_diag * _CENTER_DIST_FALLBACK
+
         existing_ids = list(self._tracks.keys())
         matched_ids = set()
         matched_det_indices = set()
@@ -95,7 +105,23 @@ class PersonTracker:
                 if score > best_iou:
                     best_iou, best_id = score, tid
 
+            # Primary match: IoU above threshold
             if best_iou >= _IOU_THRESHOLD and best_id is not None:
+                pass  # accepted — fall through to update block below
+            else:
+                # Fallback: find the nearest unmatched track by center distance
+                best_id = None
+                best_dist = max_center_dist
+                dcx, dcy = _center(det['bbox'])
+                for tid in existing_ids:
+                    if tid in matched_ids:
+                        continue
+                    tcx, tcy = _center(self._tracks[tid].bbox)
+                    dist = ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5
+                    if dist < best_dist:
+                        best_dist, best_id = dist, tid
+
+            if best_id is not None:
                 # Update existing track
                 track = self._tracks[best_id]
                 prev_cx, prev_cy = _center(track.bbox)
@@ -118,11 +144,12 @@ class PersonTracker:
                 matched_ids.add(best_id)
                 matched_det_indices.add(det_idx)
 
-        # Create new tracks for unmatched detections (up to MAX_PERSONS)
+        # Create new tracks for unmatched detections (up to max_persons limit)
+        limit = max_persons if max_persons is not None else MAX_PERSONS
         for det_idx, det in enumerate(detections):
             if det_idx in matched_det_indices:
                 continue
-            if len(self._tracks) >= MAX_PERSONS:
+            if len(self._tracks) >= limit:
                 break
             new_id = f'person{self._next_index}'
             self._next_index += 1
