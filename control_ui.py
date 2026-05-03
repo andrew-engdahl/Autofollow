@@ -672,7 +672,9 @@ class DiagnosticsWindow(QMainWindow):
     Updated every frame via update_diagnostics(); never touches the video thread.
     """
 
-    def __init__(self, parent=None):
+    overlays_changed = pyqtSignal(bool)   # emitted when "Show Overlays" is toggled
+
+    def __init__(self, show_overlays: bool = False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Autofollow Diagnostics")
         self.setMinimumSize(540, 460)
@@ -682,6 +684,17 @@ class DiagnosticsWindow(QMainWindow):
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
         layout.setSpacing(6)
+
+        # ── Show Overlays checkbox ───────────────────────────────────────
+        overlay_row = QHBoxLayout()
+        self._overlay_checkbox = QCheckBox("Show Overlays")
+        self._overlay_checkbox.setChecked(show_overlays)
+        self._overlay_checkbox.stateChanged.connect(
+            lambda state: self.overlays_changed.emit(bool(state))
+        )
+        overlay_row.addWidget(self._overlay_checkbox)
+        overlay_row.addStretch()
+        layout.addLayout(overlay_row)
 
         # ── State summary row ────────────────────────────────────────────
         state_box = QGroupBox("Tracking State")
@@ -886,7 +899,8 @@ class ControlWindow(QMainWindow):
 
         self._state = AppState()
         self._output_win = OutputWindow()
-        self._diag_win = DiagnosticsWindow()
+        self._diag_win = DiagnosticsWindow(show_overlays=self._state.show_diagnostics)
+        self._diag_win.overlays_changed.connect(self._on_diagnostics_changed)
         self._video_thread = VideoThread(self._state)
         self._video_thread.frame_ready.connect(self._on_frame)
         self._video_thread.camera_info.connect(self._on_camera_info)
