@@ -47,6 +47,20 @@ class TrackedPerson:
     profile_score: float = 0.0       # cosine similarity at last match
     frames_since_face: int = 999     # frames since the face was last matched (high = stale)
 
+    # Transient voice priority boost — applied when speaker recognition matches
+    # this person's profile. Decays back to 0 after a few seconds of silence.
+    voice_boost: float = 0.0         # 0.0 – 5.0 priority units; added to profile_priority
+    voice_boost_expires_at: float = 0.0  # time.monotonic() expiry for the boost
+
+    @property
+    def effective_priority(self) -> float:
+        """Profile priority plus any active voice boost.
+
+        Clamped to ≤15 so a recognized speaker with priority 10 caps at 15
+        (instead of unbounded growth as boosts overlap).
+        """
+        return min(15.0, float(self.profile_priority) + float(self.voice_boost))
+
 
 def _iou(a, b):
     """Intersection-over-Union of two bboxes (x_min, y_min, x_max, y_max)."""
@@ -283,6 +297,33 @@ class PersonTracker:
         track.profile_priority = int(priority)
         track.profile_score = float(score)
         track.frames_since_face = 0
+
+    def apply_voice_boost(self, profile_id: str, boost: float, hold_seconds: float) -> int:
+        """Raise voice_boost on every tracked person matched to ``profile_id``.
+
+        Called when the SpeakerRecognizer matches an enrolled voice. Returns
+        the number of tracks that received the boost (0 if no tracked person
+        is currently matched to that profile — e.g. the speaker isn't on
+        camera, only their voice is on the mic).
+        """
+        import time
+        expiry = time.monotonic() + hold_seconds
+        boosted = 0
+        for t in self._tracks.values():
+            if t.profile_id == profile_id:
+                t.voice_boost = max(t.voice_boost, float(boost))
+                t.voice_boost_expires_at = max(t.voice_boost_expires_at, expiry)
+                boosted += 1
+        return boosted
+
+    def decay_voice_boosts(self):
+        """Clear voice_boost on tracks whose boost has expired. Call per frame."""
+        import time
+        now = time.monotonic()
+        for t in self._tracks.values():
+            if t.voice_boost > 0.0 and now >= t.voice_boost_expires_at:
+                t.voice_boost = 0.0
+                t.voice_boost_expires_at = 0.0
 
     def expire_stale_face_matches(self):
         """Forget profile matches that haven't been re-confirmed recently."""

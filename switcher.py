@@ -45,6 +45,11 @@ class VirtualSwitcher:
         self._last_switch_time: float = time.monotonic()
         self._manual_request: str | None = None
         self.current_crop_width: float = 0.0  # set by caller each frame for displacement gating
+        # When True, the switcher uses music-performance defaults: shorter dwell,
+        # activity-biased target selection, no priority dwell extension. Set by
+        # the AudioThread via AppState; the visible cut/crossfade mode is left
+        # alone so the user's transition preference is preserved.
+        self.music_mode: bool = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -125,25 +130,42 @@ class VirtualSwitcher:
             self._manual_request = None
 
         if target is None and self.trigger == 'time':
-            # High-priority active subjects get a longer effective dwell so the
-            # switcher stays on (e.g.) the pastor longer than on a singer or reader.
-            # Priority biases *how long* we stay on a subject — it never gates
-            # whether unmatched people (guest speakers, etc.) are eligible.
             active_p = next((p for p in persons if p.id == self.active_id), None)
-            active_prio = active_p.profile_priority if active_p else 0
-            effective_interval = self.interval * priority_weight(active_prio)
+
+            # Effective dwell:
+            #   - Music mode: half the configured interval, no priority extension.
+            #     Performances want snappy switching between movers.
+            #   - Speech mode: priority extends dwell as before so the pastor
+            #     stays on longer than bystanders.
+            if self.music_mode:
+                effective_interval = self.interval * 0.5
+            else:
+                active_prio = active_p.effective_priority if active_p else 0
+                effective_interval = self.interval * priority_weight(int(active_prio))
 
             if now - self._last_switch_time >= effective_interval and len(persons) > 1:
-                # Cycle to the next person in tracker order — visits every
-                # detected subject regardless of profile match status. Combined
-                # with the priority-scaled dwell above this means priority
-                # people get more *total* airtime per cycle without ever
-                # excluding unmatched guests from the rotation.
-                try:
-                    current_idx = ids.index(self.active_id)
-                    target = ids[(current_idx + 1) % len(ids)]
-                except ValueError:
-                    target = ids[0]
+                if self.music_mode:
+                    # Music mode: prefer the person with the highest activity
+                    # (the band member who's moving / soloing / dancing). Ties
+                    # break on foreground area. Priority is intentionally
+                    # ignored so the pastor doesn't dominate a worship set.
+                    candidates = [p for p in persons if p.id != self.active_id]
+                    if candidates:
+                        candidates.sort(
+                            key=lambda p: (p.activity_score, p.foreground_score),
+                            reverse=True,
+                        )
+                        target = candidates[0].id
+                else:
+                    # Speech mode: cycle through every tracked person in order
+                    # so unmatched guests are always visited. Dwell scales by
+                    # priority (above), so priority people still get more
+                    # total airtime per cycle.
+                    try:
+                        current_idx = ids.index(self.active_id)
+                        target = ids[(current_idx + 1) % len(ids)]
+                    except ValueError:
+                        target = ids[0]
 
         if target is not None and not is_manual:
             # Only auto-switch if the candidate is significantly displaced from the

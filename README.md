@@ -15,6 +15,13 @@ A macOS application that intelligently crops video from a camera device using AI
 - **People profiles** — save reference images of named individuals; InsightFace
   matches them on-camera and biases the auto-switcher toward higher-priority
   people (e.g. the pastor at a church)
+- **Speaker recognition** — attach voice samples to a profile; SpeechBrain
+  ECAPA matches the live mic input and gives that person a transient priority
+  boost while they're speaking
+- **Music detection** — YAMNet identifies music vs speech in the audio stream;
+  during music performance the switcher follows the most-active performer with
+  shorter dwell. Speech (or a recognized speaker) vetoes music mode so
+  background music never overrides a sermon
 
 ## Requirements
 
@@ -241,9 +248,31 @@ Once a profile is embedded, the diagnostics overlay shows the matched name
 Profiles, images, and embeddings live in
 `~/Library/Application Support/Autofollow/profiles/`.
 
+### Voice + music detection
+
+In the **Manage People** window, pick an **Audio Input** device and tick
+**Enabled**. The Edit Person dialog adds a **Voice Samples** section — add
+WAV/FLAC files or press **Record 5 s from mic** to capture from the selected
+input.
+
+First voice embed downloads SpeechBrain ECAPA-TDNN (~80 MB to
+`~/.autofollow/models/ecapa-voxceleb/`); enabling audio analysis triggers a
+one-time YAMNet download via TF Hub.
+
+While audio is enabled:
+
+- When an enrolled voice is recognized, the corresponding tracked person's
+  effective priority gets a +5 boost for ~3 s (decays after silence). The
+  diagnostic overlay marks them with a `●` glyph.
+- When YAMNet reports sustained music (≥5 s) with no recognized speaker, the
+  switcher enters **music mode**: shorter dwell, target selection by
+  `activity_score` (the moving performers win), primary mode follows the most
+  active person.
+- A recognized enrolled voice immediately vetoes music mode — background
+  music behind a sermon does not change behavior.
+
 ## Future Enhancements
 
-- [ ] Audio capture + speaker recognition (give known voices switcher priority)
 - [ ] GPU acceleration with CoreML
 - [ ] Face detection for better head positioning  
 - [ ] Custom framing presets (tight close-up, medium shot, wide shot)

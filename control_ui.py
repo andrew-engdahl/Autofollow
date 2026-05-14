@@ -22,11 +22,16 @@ from framing_engine import FramingEngine
 from smoothing import PTZSmoother
 from switcher import VirtualSwitcher
 from profiles import ProfileStore
+from audio_thread import AudioThread, SPEAKER_BOOST_HOLD_S
 
 
 # Run face recognition every N captured frames. ~5 Hz at 30 fps capture is enough
 # to keep identities sticky without dominating the per-frame budget.
 FACE_RECOGNITION_INTERVAL = 6
+
+# Priority units added transiently to a profile whose voice is being recognized.
+# Combined with profile.priority via TrackedPerson.effective_priority.
+VOICE_PRIORITY_BOOST = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +100,12 @@ class AppState:
         self.auto_follow_enabled: bool = True
         self.foreground_exclusion_y: float = config.FOREGROUND_EXCLUSION_Y
         self.max_persons: int = config.MAX_PERSONS
+        # Phase 2: audio-driven state
+        self.music_mode: bool = False
+        # Pending voice boost: (profile_id, boost, hold_seconds). Consumed by
+        # VideoThread next frame so AudioThread → tracker handoff happens on the
+        # right thread.
+        self.pending_voice_boost: tuple | None = None
 
     def read(self):
         """Return a snapshot of current settings (thread-safe)."""
@@ -113,7 +124,14 @@ class AppState:
                 'auto_follow_enabled': self.auto_follow_enabled,
                 'foreground_exclusion_y': self.foreground_exclusion_y,
                 'max_persons': self.max_persons,
+                'music_mode': self.music_mode,
             }
+
+    def consume_voice_boost(self) -> tuple | None:
+        with QMutexLocker(self._lock):
+            val = self.pending_voice_boost
+            self.pending_voice_boost = None
+            return val
 
     def consume_manual_switch(self) -> str | None:
         with QMutexLocker(self._lock):
@@ -271,6 +289,17 @@ class VideoThread(QThread):
         self._run_face_recognition(frame, persons)
         # Forget profile matches that haven't been re-confirmed recently.
         self._tracker.expire_stale_face_matches()
+        # Apply any pending voice boost queued by the AudioThread, then decay
+        # any boosts whose hold window has expired.
+        voice_boost = self._state.consume_voice_boost()
+        if voice_boost is not None:
+            profile_id, boost, hold = voice_boost
+            self._tracker.apply_voice_boost(profile_id, boost, hold)
+        self._tracker.decay_voice_boosts()
+
+        # Mirror the latest music_mode flag into the switcher so it picks the
+        # right dwell + target-selection strategy.
+        self._switcher.music_mode = bool(settings.get('music_mode', False))
 
         # Sync switcher settings from UI state
         self._switcher.switch_mode = settings['switch_mode']
@@ -380,6 +409,8 @@ class VideoThread(QThread):
                 'profile_name': p.profile_name,
                 'profile_priority': p.profile_priority,
                 'profile_score': p.profile_score,
+                'voice_boost': p.voice_boost,
+                'effective_priority': p.effective_priority,
             })
 
         dwell_elapsed = time.monotonic() - self._primary_last_switch_time
@@ -539,11 +570,13 @@ class VideoThread(QThread):
 
             # ── ID + score label ─────────────────────────────────────────
             # Prefer the matched profile name (e.g. "Pastor Bob") over the
-            # generic personN ID. Adds a small ★ when the profile has any
-            # priority boost configured.
+            # generic personN ID. Adds ★ for static priority, and a mic glyph
+            # (●) when speaker recognition is currently boosting this person.
             id_text = person.profile_name if person.profile_name else person.id
             if person.profile_name and person.profile_priority > 0:
                 id_text = f"★{person.profile_priority} {id_text}"
+            if person.voice_boost > 0:
+                id_text = f"● {id_text}"
             label = f"{'▶ ' if is_primary else ''}{id_text}"
             font = cv2.FONT_HERSHEY_SIMPLEX
             lscale, lthick = 0.5, 1
@@ -631,8 +664,11 @@ class VideoThread(QThread):
             # closer/larger unmatched person (e.g. a guest speaker at the pulpit)
             # still wins over a low-priority profile match seated in the back.
             if persons and self._primary_id is None:
+                # effective_priority includes any active voice_boost so a
+                # recognized speaker who's currently talking is preferred even
+                # if their bbox is slightly smaller than another candidate.
                 pick = max(persons,
-                           key=lambda p: p.foreground_score * (1.0 + p.profile_priority / 20.0))
+                           key=lambda p: p.foreground_score * (1.0 + p.effective_priority / 20.0))
                 self._primary_id = pick.id
                 self._primary_last_switch_time = now
                 self._searching = False
@@ -654,6 +690,8 @@ class VideoThread(QThread):
 
         current_p = next((p for p in persons if p.id == self._primary_id), persons[0])
 
+        music_mode = getattr(self._switcher, 'music_mode', False)
+
         # --- Candidate selection: nearest (by fg_score) or significantly more active ---
         # persons[] is sorted foreground_score desc (nearest = persons[0]). The
         # raw bbox area is the source of truth for "who is closest" — priority
@@ -665,9 +703,18 @@ class VideoThread(QThread):
         # was required to arrive at the current primary, preventing oscillation when two
         # people have similar sizes.  Both fg_score and activity_score are EMA-smoothed
         # in the tracker so single-frame noise doesn't trigger a switch.
-        nearest = persons[0]
+        if music_mode:
+            # In music mode the most-active performer is the right primary —
+            # they're singing, soloing, or leading the band. Fall back to
+            # foreground area when nobody is significantly moving.
+            nearest = max(persons,
+                          key=lambda p: (p.activity_score, p.foreground_score))
+        else:
+            nearest = persons[0]
+        # Music mode halves the minimum dwell so we can follow song dynamics.
+        min_dwell = 1.5 if music_mode else 3.0
         if nearest.id != self._primary_id and self._primary_pending_id is None:
-            if now - self._primary_last_switch_time >= 3.0:
+            if now - self._primary_last_switch_time >= min_dwell:
                 fg_ratio = nearest.foreground_score / max(current_p.foreground_score, 1e-6)
                 cand_act = nearest.activity_score
                 curr_act = current_p.activity_score
@@ -678,7 +725,7 @@ class VideoThread(QThread):
                 # frame currently following an unmatched person) and we should
                 # switch eagerly; priority_diff < 0 means we should stick with
                 # the priority person against a bystander a bit longer.
-                priority_diff = nearest.profile_priority - current_p.profile_priority
+                priority_diff = nearest.effective_priority - current_p.effective_priority
                 # Threshold range: priority_diff= +10 -> 1.0 (any closer wins),
                 #                  priority_diff=   0 -> 1.5 (50% closer),
                 #                  priority_diff= -10 -> 2.25 (must be 125% closer).
@@ -1144,6 +1191,13 @@ class ControlWindow(QMainWindow):
         self._diag_win = DiagnosticsWindow(show_overlays=self._state.show_diagnostics)
         self._diag_win.overlays_changed.connect(self._on_diagnostics_changed)
         self._video_thread = VideoThread(self._state, profile_store=self._profile_store)
+        # Audio analysis (capture + VAD + speaker recognition + music classification)
+        self._audio_thread = AudioThread(self._profile_store)
+        self._audio_thread.audio_state_changed.connect(self._on_audio_state_changed)
+        self._audio_thread.speaker_detected.connect(self._on_speaker_detected)
+        self._audio_thread.error.connect(self._on_audio_error)
+        # Surface the latest audio state to the UI label
+        self._audio_status_text = "Audio: off"
         self._video_thread.frame_ready.connect(self._on_frame)
         self._video_thread.diag_frame_ready.connect(self._diag_win.update_video)
         self._video_thread.camera_info.connect(self._on_camera_info)
@@ -1156,6 +1210,10 @@ class ControlWindow(QMainWindow):
 
         self._build_ui()
         self._video_thread.start()
+        # Audio analysis starts disabled. The user enables it from the People
+        # window by picking an input device; this avoids grabbing the mic
+        # on startup (and skips the YAMNet/SpeechBrain downloads until needed).
+        self._audio_thread.start()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1397,7 +1455,8 @@ class ControlWindow(QMainWindow):
         self._status_label.setText(
             f"FPS: {meta['fps']:.1f}  |  "
             f"Detected: {meta['n_persons']} person(s)  |  "
-            f"Active: {meta['active_id']}"
+            f"Active: {meta['active_id']}  |  "
+            f"{self._audio_status_text}"
         )
 
     def _on_camera_info(self, info: str):
@@ -1500,17 +1559,46 @@ class ControlWindow(QMainWindow):
         self._diag_win.show()
         self._diag_win.raise_()
 
+    # ------------------------------------------------------------------
+    # Audio signal handlers
+    # ------------------------------------------------------------------
+
+    def _on_audio_state_changed(self, music_mode: bool, music_score: float,
+                                speech_score: float):
+        with QMutexLocker(self._state._lock):
+            self._state.music_mode = music_mode
+        mode_text = "MUSIC" if music_mode else "Speech"
+        self._audio_status_text = (
+            f"Audio: {mode_text}  (music={music_score:.2f}, speech={speech_score:.2f})"
+        )
+
+    def _on_speaker_detected(self, profile_id: str, name: str, score: float):
+        # Queue a voice boost for the VideoThread to apply on the next frame.
+        with QMutexLocker(self._state._lock):
+            self._state.pending_voice_boost = (
+                profile_id, VOICE_PRIORITY_BOOST, SPEAKER_BOOST_HOLD_S
+            )
+        self._audio_status_text = f"Audio: ● {name}  ({score:.2f})"
+
+    def _on_audio_error(self, msg: str):
+        self._audio_status_text = f"Audio error: {msg}"
+
     def _open_people(self):
         if self._people_win is None:
             from people_ui import PeopleWindow
             self._people_win = PeopleWindow(
                 self._profile_store,
                 frame_grabber=self._video_thread.grab_latest_frame,
+                audio_thread=self._audio_thread,
                 parent=self,
             )
             # Tell the video thread to rebuild its embedding index whenever
             # the profile set changes (add/edit/delete/re-embed).
             self._people_win.profiles_changed.connect(self._video_thread.reindex_profiles)
+            # Voice profile changes invalidate the SpeakerRecognizer's index.
+            self._people_win.voice_profiles_changed.connect(
+                self._audio_thread.reindex_voice_profiles
+            )
         self._people_win.show()
         self._people_win.raise_()
         self._people_win.activateWindow()
@@ -1519,6 +1607,7 @@ class ControlWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._video_thread.stop()
+        self._audio_thread.stop()
         self._output_win.close()
         self._diag_win.close()
         if self._people_win is not None:
