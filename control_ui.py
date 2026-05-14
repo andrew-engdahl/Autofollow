@@ -102,6 +102,14 @@ class AppState:
         self.max_persons: int = config.MAX_PERSONS
         # Phase 2: audio-driven state
         self.music_mode: bool = False
+        self.audio_enabled: bool = False
+        self.audio_music_score: float = 0.0
+        self.audio_speech_score: float = 0.0
+        # Most-recent recognized speaker (sticky until a different one matches
+        # or the boost window expires; shown in the diagnostics panel).
+        self.audio_speaker_name: str | None = None
+        self.audio_speaker_score: float = 0.0
+        self.audio_speaker_expires_at: float = 0.0
         # Pending voice boost: (profile_id, boost, hold_seconds). Consumed by
         # VideoThread next frame so AudioThread → tracker handoff happens on the
         # right thread.
@@ -414,6 +422,23 @@ class VideoThread(QThread):
             })
 
         dwell_elapsed = time.monotonic() - self._primary_last_switch_time
+        # Snapshot audio state for the diagnostics panel. Read under the state
+        # lock so we get a consistent view of speaker_name + scores together.
+        now = time.monotonic()
+        with QMutexLocker(self._state._lock):
+            spk_name = self._state.audio_speaker_name
+            spk_score = self._state.audio_speaker_score
+            spk_expires = self._state.audio_speaker_expires_at
+            audio_state = {
+                'enabled': self._state.audio_enabled,
+                'music_mode': self._state.music_mode,
+                'music_score': self._state.audio_music_score,
+                'speech_score': self._state.audio_speech_score,
+                # Expire the sticky speaker name once the hold window passes
+                # so the panel doesn't lie about who's currently talking.
+                'speaker_name': spk_name if now < spk_expires else None,
+                'speaker_score': spk_score if now < spk_expires else 0.0,
+            }
         meta = {
             'fps': fps,
             'n_persons': len(persons),
@@ -428,6 +453,7 @@ class VideoThread(QThread):
             'smoother_primary': self._smoother.get_state('primary'),
             'searching': self._searching,
             'person_index_map': dict(self._person_index_map),
+            'audio_state': audio_state,
         }
         return _bgr_to_qimage(output_frame), meta
 
@@ -931,14 +957,27 @@ class DiagnosticsWindow(QMainWindow):
         self._lbl_phase    = self._make_field("Phase", state_grid)
         self._lbl_dwell    = self._make_field("Dwell", state_grid)
         self._lbl_fps      = self._make_field("FPS", state_grid)
+        self._lbl_persons  = self._make_field("Persons", state_grid)
         layout.addWidget(state_box)
 
+        # ── Audio state row ──────────────────────────────────────────────
+        audio_box = QGroupBox("Audio")
+        audio_grid = QHBoxLayout(audio_box)
+        self._lbl_audio_mode    = self._make_field("Mode", audio_grid)
+        self._lbl_audio_speaker = self._make_field("Speaker", audio_grid)
+        self._lbl_audio_scores  = self._make_field("Music/Speech", audio_grid)
+        layout.addWidget(audio_box)
+
         # ── Per-person table ─────────────────────────────────────────────
+        # Columns: swatch, ID/profile name, face match score, voice boost,
+        # foreground score, activity score, ratios, unseen, position, zoom.
         persons_box = QGroupBox("Tracked Persons")
         persons_layout = QVBoxLayout(persons_box)
-        self._table = QTableWidget(0, 9)
+        self._table = QTableWidget(0, 11)
         self._table.setHorizontalHeaderLabels(
-            ["", "ID", "FG(sm)", "Act(sm)", "FG Ratio", "Act Ratio", "Unseen", "Center X,Y", "Zoom(sm)"]
+            ["", "ID / Profile", "Face", "Voice",
+             "FG(sm)", "Act(sm)", "FG Ratio", "Act Ratio",
+             "Unseen", "Center X,Y", "Zoom(sm)"]
         )
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1031,6 +1070,31 @@ class DiagnosticsWindow(QMainWindow):
             self._lbl_phase.setText(phase)
             self._lbl_dwell.setText(f"{dwell:.2f}/{dwell_threshold:.0f}s")
             self._lbl_fps.setText(f"{fps:.1f}")
+            self._lbl_persons.setText(str(meta.get('n_persons', len(persons))))
+
+            # Audio panel: surfaces the most recent state pushed by AudioThread.
+            audio_state = meta.get('audio_state') or {}
+            music_mode = bool(audio_state.get('music_mode', False))
+            spk_name = audio_state.get('speaker_name')
+            spk_score = audio_state.get('speaker_score', 0.0)
+            music_s = audio_state.get('music_score', 0.0)
+            speech_s = audio_state.get('speech_score', 0.0)
+            if audio_state.get('enabled'):
+                self._lbl_audio_mode.setText("MUSIC" if music_mode else "Speech")
+                self._lbl_audio_mode.setStyleSheet(
+                    "color: #c678dd; font-weight: bold;" if music_mode
+                    else "color: #98c379; font-weight: bold;"
+                )
+            else:
+                self._lbl_audio_mode.setText("off")
+                self._lbl_audio_mode.setStyleSheet("color: gray;")
+            if spk_name:
+                self._lbl_audio_speaker.setText(f"● {spk_name} ({spk_score:.2f})")
+                self._lbl_audio_speaker.setStyleSheet("color: #61afef; font-weight: bold;")
+            else:
+                self._lbl_audio_speaker.setText("—")
+                self._lbl_audio_speaker.setStyleSheet("color: gray;")
+            self._lbl_audio_scores.setText(f"m={music_s:.2f} / s={speech_s:.2f}")
 
             # Red = gate closed (can't switch yet), green = gate open
             if not gate_open:
@@ -1078,8 +1142,29 @@ class DiagnosticsWindow(QMainWindow):
                 swatch.setTextAlignment(Qt.AlignCenter)
                 self._table.setItem(row, 0, swatch)
 
+                # Face match column: profile name + cosine score, or em-dash
+                profile_name = p.get('profile_name')
+                profile_score = p.get('profile_score', 0.0)
+                profile_priority = p.get('profile_priority', 0)
+                if profile_name:
+                    face_cell = f"{profile_name} ★{profile_priority} ({profile_score:.2f})"
+                    id_cell = f"{pid} → {profile_name}"
+                else:
+                    face_cell = "—"
+                    id_cell = pid
+
+                # Voice column: active boost indicator + effective priority
+                voice_boost = p.get('voice_boost', 0.0)
+                effective_prio = p.get('effective_priority', profile_priority)
+                if voice_boost > 0:
+                    voice_cell = f"● +{voice_boost:.0f} (eff {effective_prio:.0f})"
+                else:
+                    voice_cell = "—"
+
                 cells = [
-                    pid,
+                    id_cell,
+                    face_cell,
+                    voice_cell,
                     f"{fg:.4f}",
                     f"{act:.2f}",
                     f"{'!' if fg_trigger  else ''}{fg_ratio:.2f}",
@@ -1567,17 +1652,25 @@ class ControlWindow(QMainWindow):
                                 speech_score: float):
         with QMutexLocker(self._state._lock):
             self._state.music_mode = music_mode
+            self._state.audio_music_score = music_score
+            self._state.audio_speech_score = speech_score
+            self._state.audio_enabled = self._audio_thread.is_capturing
         mode_text = "MUSIC" if music_mode else "Speech"
         self._audio_status_text = (
             f"Audio: {mode_text}  (music={music_score:.2f}, speech={speech_score:.2f})"
         )
 
     def _on_speaker_detected(self, profile_id: str, name: str, score: float):
+        import time
         # Queue a voice boost for the VideoThread to apply on the next frame.
         with QMutexLocker(self._state._lock):
             self._state.pending_voice_boost = (
                 profile_id, VOICE_PRIORITY_BOOST, SPEAKER_BOOST_HOLD_S
             )
+            self._state.audio_speaker_name = name
+            self._state.audio_speaker_score = float(score)
+            self._state.audio_speaker_expires_at = time.monotonic() + SPEAKER_BOOST_HOLD_S
+            self._state.audio_enabled = self._audio_thread.is_capturing
         self._audio_status_text = f"Audio: ● {name}  ({score:.2f})"
 
     def _on_audio_error(self, msg: str):

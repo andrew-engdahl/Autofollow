@@ -118,15 +118,22 @@ class AudioThread(QThread):
         """Enable or disable audio analysis entirely.
 
         When disabled, capture is stopped and music_mode is forced off.
+        Either transition emits ``audio_state_changed`` so the diagnostics
+        panel can update its "enabled" indicator without waiting for the
+        next analysis tick.
         """
+        was_capturing = self._capture.is_running
         self._enabled = enabled
         if enabled:
             self._capture.start(self._device_index)
+            if not was_capturing:
+                self.audio_state_changed.emit(self._music_mode, 0.0, 0.0)
         else:
             self._capture.stop()
             if self._music_mode:
                 self._music_mode = False
-                self.audio_state_changed.emit(False, 0.0, 0.0)
+            # Always emit on disable so the UI reflects the off state.
+            self.audio_state_changed.emit(False, 0.0, 0.0)
 
     def reindex_voice_profiles(self):
         if self._speaker_rec is not None:
