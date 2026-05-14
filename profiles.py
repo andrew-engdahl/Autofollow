@@ -316,6 +316,21 @@ class ProfileStore:
             path.unlink()
         if filename in profile.image_filenames:
             profile.image_filenames.remove(filename)
+        # Drop the corresponding row from the cached face embeddings (mirrors
+        # remove_voice_sample). Keeps the FaceRecognizer's per-profile mean
+        # consistent with the on-disk reference images.
+        embed_path = self.root / profile.id / "embeddings.npy"
+        index_path = self.root / profile.id / "embeddings_index.json"
+        if embed_path.exists() and index_path.exists():
+            try:
+                with open(index_path) as f:
+                    idx = json.load(f)
+                arr = np.load(embed_path)
+                kept = {fn: arr[row] for fn, row in idx.items()
+                        if fn != filename and fn in profile.image_filenames}
+                self.save_embeddings(profile, kept)
+            except (OSError, ValueError, KeyError):
+                self.save_embeddings(profile, {})
         return True
 
     def image_path(self, profile_id: str, filename: str) -> Path | None:
@@ -355,6 +370,24 @@ class ProfileStore:
             path.unlink()
         if filename in profile.voice_filenames:
             profile.voice_filenames.remove(filename)
+        # Drop the corresponding row from the cached embeddings so the
+        # SpeakerRecognizer doesn't keep using a stale mean that includes
+        # this sample. If we can't read the per-file index just clear the
+        # cache entirely — the user can re-index from the People window.
+        embed_path = self.root / profile.id / "voice_embeddings.npy"
+        index_path = self.root / profile.id / "voice_embeddings_index.json"
+        if embed_path.exists() and index_path.exists():
+            try:
+                with open(index_path) as f:
+                    idx = json.load(f)
+                arr = np.load(embed_path)
+                kept = {fn: arr[row] for fn, row in idx.items()
+                        if fn != filename and fn in profile.voice_filenames}
+                self.save_voice_embeddings(profile, kept)
+            except (OSError, ValueError, KeyError):
+                # Cache is unusable — wipe it; profile.voice_embeddings is set
+                # to None by save_voice_embeddings on empty input.
+                self.save_voice_embeddings(profile, {})
         return True
 
     def voice_path(self, profile_id: str, filename: str) -> Path | None:

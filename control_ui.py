@@ -1311,6 +1311,7 @@ class ControlWindow(QMainWindow):
         layout.setSpacing(8)
 
         layout.addWidget(self._build_camera_section())
+        layout.addWidget(self._build_audio_section())
         layout.addWidget(self._build_shot_section())
         layout.addWidget(self._build_switcher_section())
         layout.addWidget(self._preview_label)
@@ -1346,6 +1347,72 @@ class ControlWindow(QMainWindow):
                 self._cam_combo.setCurrentIndex(i)
                 break
         self._cam_combo.blockSignals(False)
+
+    # --- Audio ---
+
+    def _build_audio_section(self):
+        """Audio input controls — Enabled toggle + input device picker.
+
+        Drives the AudioThread. Same controls exist in the People window
+        because that's where you record voice samples, but having them here
+        means the user doesn't have to open Manage People just to turn audio
+        analysis on or off.
+        """
+        box = QGroupBox("Audio (speaker + music detection)")
+        row = QHBoxLayout(box)
+        self._audio_enable_cb = QCheckBox("Enabled")
+        self._audio_enable_cb.setChecked(self._audio_thread.is_capturing)
+        self._audio_enable_cb.toggled.connect(self._on_audio_enabled_toggled)
+        row.addWidget(self._audio_enable_cb)
+
+        row.addWidget(QLabel("Input:"))
+        self._audio_combo = QComboBox()
+        self._populate_audio_devices_combo()
+        self._audio_combo.currentIndexChanged.connect(self._on_audio_device_changed)
+        row.addWidget(self._audio_combo, stretch=1)
+
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.setFixedWidth(70)
+        btn_refresh.clicked.connect(self._populate_audio_devices_combo)
+        row.addWidget(btn_refresh)
+        return box
+
+    def _populate_audio_devices_combo(self):
+        from audio_capture import list_input_devices
+        self._audio_combo.blockSignals(True)
+        self._audio_combo.clear()
+        self._audio_combo.addItem("(System default)", None)
+        for dev in list_input_devices():
+            self._audio_combo.addItem(
+                f"[{dev['index']}] {dev['name']} ({dev['max_channels']}ch)",
+                dev['index'],
+            )
+        # Reflect current selection if any
+        if self._audio_thread.device_index is not None:
+            for i in range(self._audio_combo.count()):
+                if self._audio_combo.itemData(i) == self._audio_thread.device_index:
+                    self._audio_combo.setCurrentIndex(i)
+                    break
+        self._audio_combo.blockSignals(False)
+
+    def _on_audio_enabled_toggled(self, on: bool):
+        if on:
+            device_index = self._audio_combo.itemData(self._audio_combo.currentIndex())
+            self._audio_thread.set_device(device_index)
+            self._audio_thread.set_enabled(True)
+        else:
+            self._audio_thread.set_enabled(False)
+        # Keep the People window's checkbox/dropdown in sync if it's open.
+        if self._people_win is not None:
+            people_cb = getattr(self._people_win, '_audio_enable', None)
+            if people_cb is not None and people_cb.isChecked() != on:
+                people_cb.blockSignals(True)
+                people_cb.setChecked(on)
+                people_cb.blockSignals(False)
+
+    def _on_audio_device_changed(self, idx: int):
+        device_index = self._audio_combo.itemData(idx)
+        self._audio_thread.set_device(device_index)
 
     # --- Shot type ---
 
@@ -1650,15 +1717,25 @@ class ControlWindow(QMainWindow):
 
     def _on_audio_state_changed(self, music_mode: bool, music_score: float,
                                 speech_score: float):
+        enabled_now = self._audio_thread.is_capturing
         with QMutexLocker(self._state._lock):
             self._state.music_mode = music_mode
             self._state.audio_music_score = music_score
             self._state.audio_speech_score = speech_score
-            self._state.audio_enabled = self._audio_thread.is_capturing
+            self._state.audio_enabled = enabled_now
         mode_text = "MUSIC" if music_mode else "Speech"
         self._audio_status_text = (
             f"Audio: {mode_text}  (music={music_score:.2f}, speech={speech_score:.2f})"
+            if enabled_now else "Audio: off"
         )
+        # Reflect enabled state in the main-panel checkbox so external
+        # changes (e.g. toggling from the People window, or a device error)
+        # are visible without the user needing to click anywhere.
+        cb = getattr(self, '_audio_enable_cb', None)
+        if cb is not None and cb.isChecked() != enabled_now:
+            cb.blockSignals(True)
+            cb.setChecked(enabled_now)
+            cb.blockSignals(False)
 
     def _on_speaker_detected(self, profile_id: str, name: str, score: float):
         import time

@@ -102,6 +102,11 @@ class EditProfileDialog(QDialog):
         self._pending_frame_captures: list[np.ndarray] = []   # frame bytes to write on save
         self._pending_voice_paths: list[Path] = []     # external voice files to copy on save
         self._pending_voice_recordings: list[np.ndarray] = []  # captured 16kHz mono samples
+        # Track when the user removed an *existing* (on-disk) sample inside
+        # this dialog so PeopleWindow knows to invalidate recognizer indices
+        # on Save even if no new samples were added.
+        self._removed_existing_image: bool = False
+        self._removed_existing_voice: bool = False
         self._record_timer: QTimer | None = None
         self._record_remaining_s: float = 0.0
         self._record_btn = None     # set below in voice section
@@ -175,16 +180,26 @@ class EditProfileDialog(QDialog):
         self._record_btn = QPushButton("Record 5 s from mic")
         self._record_btn.setEnabled(audio_grabber is not None)
         self._record_btn.clicked.connect(self._on_record_voice)
+        # Explicit remove button — parity with the per-image Remove buttons in
+        # the reference-image gallery. Operates on the current voice-list
+        # selection. (Double-clicking an item still works as a shortcut.)
+        self._remove_voice_btn = QPushButton("Remove Selected")
+        self._remove_voice_btn.setEnabled(False)
+        self._remove_voice_btn.clicked.connect(self._on_remove_selected_voice)
         v_btn_row.addWidget(btn_voice_file)
         v_btn_row.addWidget(self._record_btn)
+        v_btn_row.addWidget(self._remove_voice_btn)
         v_btn_row.addStretch()
         voice_layout.addLayout(v_btn_row)
         self._voice_list = QListWidget()
         self._voice_list.setMaximumHeight(120)
+        # Enable the Remove button only when a real (non-placeholder) row is selected.
+        self._voice_list.itemSelectionChanged.connect(self._on_voice_selection_changed)
         voice_layout.addWidget(self._voice_list)
         v_hint = QLabel(
             "Provide ≥10 s of clean speech (this person, no background music).\n"
-            "Multiple short samples are better than one long one."
+            "Multiple short samples are better than one long one.\n"
+            "Select a sample and click Remove Selected (or double-click it)."
         )
         v_hint.setStyleSheet("color: gray; font-size: 10px;")
         voice_layout.addWidget(v_hint)
@@ -272,17 +287,36 @@ class EditProfileDialog(QDialog):
         self._refresh_voice_list()
 
     def _on_voice_double_click(self, item):
+        self._remove_voice_item(item, confirm=True)
+
+    def _on_remove_selected_voice(self):
+        item = self._voice_list.currentItem()
+        if item is None:
+            return
+        self._remove_voice_item(item, confirm=True)
+
+    def _on_voice_selection_changed(self):
+        # Enable Remove only when the current row is an actual sample,
+        # not the "(No voice samples yet)" placeholder.
+        item = self._voice_list.currentItem()
+        has_real_selection = (
+            item is not None and item.data(Qt.UserRole) is not None
+        )
+        self._remove_voice_btn.setEnabled(has_real_selection)
+
+    def _remove_voice_item(self, item, confirm: bool = True):
         kind_data = item.data(Qt.UserRole)
         if not kind_data:
             return
         kind, payload = kind_data
-        if QMessageBox.question(
+        if confirm and QMessageBox.question(
             self, "Remove sample", "Remove this voice sample?",
             QMessageBox.Yes | QMessageBox.No
         ) != QMessageBox.Yes:
             return
         if kind == "saved" and self._profile is not None:
             self._store.remove_voice_sample(self._profile.id, payload)
+            self._removed_existing_voice = True
         elif kind == "pending_file":
             self._pending_voice_paths = [
                 p for p in self._pending_voice_paths if str(p) != payload
@@ -318,6 +352,14 @@ class EditProfileDialog(QDialog):
 
     def has_pending_voice_changes(self) -> bool:
         return bool(self._pending_voice_paths or self._pending_voice_recordings)
+
+    def had_image_removals(self) -> bool:
+        """True if the user deleted any existing reference image in this session."""
+        return self._removed_existing_image
+
+    def had_voice_removals(self) -> bool:
+        """True if the user deleted any existing voice sample in this session."""
+        return self._removed_existing_voice
 
     # ------------------------------------------------------------------
 
@@ -422,8 +464,9 @@ class EditProfileDialog(QDialog):
         self._refresh_gallery()
 
     def _remove_existing_image(self, filename: str):
-        # Only marked for actual deletion on accept(); for now stage by mutating
-        # the profile in-place. The on-disk file is removed by the store.
+        # The on-disk file (and its cached embedding row) is removed by the
+        # store immediately; the dialog tracks that a removal happened so
+        # PeopleWindow knows to refresh the running recognizer index on Save.
         if self._profile is None:
             return
         if QMessageBox.question(
@@ -432,6 +475,7 @@ class EditProfileDialog(QDialog):
         ) != QMessageBox.Yes:
             return
         self._store.remove_image(self._profile.id, filename)
+        self._removed_existing_image = True
         self._refresh_gallery()
 
     def _remove_pending_path(self, path: Path):
@@ -616,6 +660,8 @@ class PeopleWindow(QMainWindow):
             return
         had_image_changes = dlg.has_pending_image_changes()
         had_voice_changes = dlg.has_pending_voice_changes()
+        had_image_removals = dlg.had_image_removals()
+        had_voice_removals = dlg.had_voice_removals()
         self._store.update(profile.id, name=dlg.name(), priority=dlg.priority())
         dlg.commit_pending_images(profile)
         dlg.commit_pending_voice(profile)
@@ -623,9 +669,19 @@ class PeopleWindow(QMainWindow):
             self._start_embed(profile.id)
         if had_voice_changes:
             self._start_voice_embed(profile.id)
-        if not (had_image_changes or had_voice_changes):
+        # Removals don't need re-embedding (the store already updated the
+        # cached arrays), but the live recognizers must invalidate their
+        # in-memory index so the next inference uses the trimmed embeddings.
+        if had_image_removals and not had_image_changes:
+            self.profiles_changed.emit()
+        if had_voice_removals and not had_voice_changes:
+            self.voice_profiles_changed.emit()
+        if not (had_image_changes or had_voice_changes
+                or had_image_removals or had_voice_removals):
             self._refresh_list()
             self.profiles_changed.emit()
+        else:
+            self._refresh_list()
 
     def _delete_selected(self):
         profile = self._selected_profile()
