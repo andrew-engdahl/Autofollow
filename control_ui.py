@@ -21,6 +21,12 @@ from tracker import PersonTracker
 from framing_engine import FramingEngine
 from smoothing import PTZSmoother
 from switcher import VirtualSwitcher
+from profiles import ProfileStore
+
+
+# Run face recognition every N captured frames. ~5 Hz at 30 fps capture is enough
+# to keep identities sticky without dominating the per-frame budget.
+FACE_RECOGNITION_INTERVAL = 6
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +140,8 @@ class VideoThread(QThread):
     camera_info = pyqtSignal(str)             # e.g. "1920x1080 @ 30fps"
     persons_updated = pyqtSignal(list)        # list of person IDs currently tracked
 
-    def __init__(self, state: AppState, parent=None):
+    def __init__(self, state: AppState, profile_store: ProfileStore | None = None,
+                 parent=None):
         super().__init__(parent)
         self._state = state
         self._running = False
@@ -147,6 +154,17 @@ class VideoThread(QThread):
         self._smoother = PTZSmoother()
         self._switcher = VirtualSwitcher()
         self._frame_count = 0
+
+        # Face recognition (lazy — model loads on first use)
+        self._profile_store = profile_store
+        self._face_recognizer = None
+        self._face_recognition_failed = False  # True if init failed; don't retry
+        self._face_cadence_offset = 0
+
+        # Latest raw camera frame (BGR) — used by the People UI to capture
+        # reference images of someone currently in front of the camera.
+        self._latest_frame_lock = threading.Lock()
+        self._latest_frame: np.ndarray | None = None
 
         self._person_index_map: dict[str, int] = {}   # stable color index per person ID
         self._next_person_color_idx: int = 0
@@ -191,6 +209,10 @@ class VideoThread(QThread):
                 self.msleep(10)
                 continue
 
+            # Stash a copy of the raw frame for "capture from camera" in People UI.
+            with self._latest_frame_lock:
+                self._latest_frame = frame.copy()
+
             result = self._process_frame(frame, settings)
             if result is not None:
                 qimg, meta = result
@@ -203,6 +225,11 @@ class VideoThread(QThread):
         self.wait()
         if self._cap:
             self._cap.release()
+
+    def grab_latest_frame(self) -> np.ndarray | None:
+        """Return a copy of the most recent raw camera frame, or None."""
+        with self._latest_frame_lock:
+            return None if self._latest_frame is None else self._latest_frame.copy()
 
     # ------------------------------------------------------------------
     # Camera open
@@ -238,6 +265,12 @@ class VideoThread(QThread):
         persons = self._tracker.update(detections, frame.shape,
                                        foreground_exclusion_y=settings.get('foreground_exclusion_y', 0.0),
                                        max_persons=settings.get('max_persons', config.MAX_PERSONS))
+
+        # Face recognition (slow cadence). Tracker has already updated bboxes,
+        # so we can spatially match detected faces back to tracked person IDs.
+        self._run_face_recognition(frame, persons)
+        # Forget profile matches that haven't been re-confirmed recently.
+        self._tracker.expire_stale_face_matches()
 
         # Sync switcher settings from UI state
         self._switcher.switch_mode = settings['switch_mode']
@@ -343,6 +376,10 @@ class VideoThread(QThread):
                 'smoother_x': smoother_state.get('x'),
                 'smoother_zoom': smoother_state.get('zoom'),
                 'frames_unseen': p.frames_unseen,
+                'profile_id': p.profile_id,
+                'profile_name': p.profile_name,
+                'profile_priority': p.profile_priority,
+                'profile_score': p.profile_score,
             })
 
         dwell_elapsed = time.monotonic() - self._primary_last_switch_time
@@ -362,6 +399,68 @@ class VideoThread(QThread):
             'person_index_map': dict(self._person_index_map),
         }
         return _bgr_to_qimage(output_frame), meta
+
+    # ------------------------------------------------------------------
+    # Face recognition
+    # ------------------------------------------------------------------
+
+    def _run_face_recognition(self, frame, persons):
+        """Run face recognition on the current frame and tag tracker persons.
+
+        Skipped when:
+          - No profile store is wired (face recognition disabled at startup).
+          - Earlier init failed (we never retry inside the loop).
+          - No profiles with embeddings exist (nothing to match against).
+          - The current frame isn't on the FACE_RECOGNITION_INTERVAL cadence.
+          - No persons are tracked (nothing to attach a match to).
+        """
+        if self._profile_store is None or self._face_recognition_failed:
+            return
+        if not persons:
+            return
+        # Cadence: only run every Nth frame
+        if (self._frame_count + self._face_cadence_offset) % FACE_RECOGNITION_INTERVAL != 0:
+            return
+        # No profiles with embeddings? skip the (expensive) detect-and-match call.
+        has_indexed = any(p.embeddings is not None and len(p.embeddings) > 0
+                          for p in self._profile_store.list())
+        if not has_indexed:
+            return
+
+        # Lazy-init the recognizer on first use so app startup is fast.
+        if self._face_recognizer is None:
+            try:
+                from face_recognizer import FaceRecognizer
+                self._face_recognizer = FaceRecognizer(self._profile_store)
+            except Exception as e:
+                print(f"FaceRecognizer init failed: {e}")
+                self._face_recognition_failed = True
+                return
+
+        try:
+            faces = self._face_recognizer.identify(frame)
+        except Exception as e:
+            print(f"Face identify failed: {e}")
+            return
+
+        for face in faces:
+            if face.get("profile_id") is None:
+                continue
+            tid = self._tracker.find_by_face_bbox(face["bbox"], frame.shape)
+            if tid is None:
+                continue
+            self._tracker.set_profile_match(
+                tid,
+                face["profile_id"],
+                face["name"],
+                face["priority"],
+                face["score"],
+            )
+
+    def reindex_profiles(self):
+        """Tell the face recognizer to rebuild its profile index on next call."""
+        if self._face_recognizer is not None:
+            self._face_recognizer.mark_index_dirty()
 
     # ------------------------------------------------------------------
     # Diagnostic overlay
@@ -439,7 +538,13 @@ class VideoThread(QThread):
                 cv2.circle(out, (cx_p, cy_p), 10, color,           2, cv2.LINE_AA)
 
             # ── ID + score label ─────────────────────────────────────────
-            label = f"{'▶ ' if is_primary else ''}{person.id}"
+            # Prefer the matched profile name (e.g. "Pastor Bob") over the
+            # generic personN ID. Adds a small ★ when the profile has any
+            # priority boost configured.
+            id_text = person.profile_name if person.profile_name else person.id
+            if person.profile_name and person.profile_priority > 0:
+                id_text = f"★{person.profile_priority} {id_text}"
+            label = f"{'▶ ' if is_primary else ''}{id_text}"
             font = cv2.FONT_HERSHEY_SIMPLEX
             lscale, lthick = 0.5, 1
             (tw, th), _ = cv2.getTextSize(label, font, lscale, lthick)
@@ -520,9 +625,15 @@ class VideoThread(QThread):
                 self._primary_pretraveling = False
                 self._primary_fade_start = None
 
-            # Try to adopt the first available person as primary once we have one
+            # Adopt the largest-in-frame person as initial primary, with a small
+            # priority bias so a profile-matched person beats a similarly-sized
+            # unmatched bystander.  The bias is capped at 1.5x so an obviously
+            # closer/larger unmatched person (e.g. a guest speaker at the pulpit)
+            # still wins over a low-priority profile match seated in the back.
             if persons and self._primary_id is None:
-                self._primary_id = persons[0].id
+                pick = max(persons,
+                           key=lambda p: p.foreground_score * (1.0 + p.profile_priority / 20.0))
+                self._primary_id = pick.id
                 self._primary_last_switch_time = now
                 self._searching = False
             else:
@@ -544,7 +655,12 @@ class VideoThread(QThread):
         current_p = next((p for p in persons if p.id == self._primary_id), persons[0])
 
         # --- Candidate selection: nearest (by fg_score) or significantly more active ---
-        # persons[] is sorted foreground_score desc (nearest = persons[0])
+        # persons[] is sorted foreground_score desc (nearest = persons[0]). The
+        # raw bbox area is the source of truth for "who is closest" — priority
+        # never *changes* the nearest pick, only how reluctant we are to switch.
+        # This keeps unmatched subjects (guest speakers, readers, anyone whose
+        # face isn't in the profile store) fully eligible to become primary
+        # whenever they're clearly closer to the camera than the current one.
         # fg_ratio thresholds use hysteresis: a higher bar to initiate a switch than
         # was required to arrive at the current primary, preventing oscillation when two
         # people have similar sizes.  Both fg_score and activity_score are EMA-smoothed
@@ -555,11 +671,26 @@ class VideoThread(QThread):
                 fg_ratio = nearest.foreground_score / max(current_p.foreground_score, 1e-6)
                 cand_act = nearest.activity_score
                 curr_act = current_p.activity_score
-                # Proximity switch: candidate must be substantially closer (50% more area).
-                fg_wins = fg_ratio >= 1.5
+
+                # Priority modulates the switch threshold but never gates the
+                # candidate. priority_diff > 0 means the candidate has higher
+                # priority than the current primary (e.g. pastor entering a
+                # frame currently following an unmatched person) and we should
+                # switch eagerly; priority_diff < 0 means we should stick with
+                # the priority person against a bystander a bit longer.
+                priority_diff = nearest.profile_priority - current_p.profile_priority
+                # Threshold range: priority_diff= +10 -> 1.0 (any closer wins),
+                #                  priority_diff=   0 -> 1.5 (50% closer),
+                #                  priority_diff= -10 -> 2.25 (must be 125% closer).
+                switch_threshold = max(1.0, 1.5 - priority_diff * 0.075)
+
+                # Eager priority override: strictly higher-priority candidate
+                # and at least as close — switch immediately.
+                priority_override = (priority_diff > 0 and fg_ratio >= 1.0)
+                fg_wins = fg_ratio >= switch_threshold
                 # Activity switch: candidate must clear a noise floor AND be 2× more active.
                 activity_wins = cand_act >= 5.0 and cand_act > curr_act * 2.0
-                if fg_wins or activity_wins:
+                if priority_override or fg_wins or activity_wins:
                     self._primary_pending_id = nearest.id
                     self._primary_pretraveling = True
                     self._primary_pretravel_start = now
@@ -1006,10 +1137,13 @@ class ControlWindow(QMainWindow):
         self.setMinimumWidth(340)
 
         self._state = AppState()
+        self._profile_store = ProfileStore()
+        self._people_win = None  # lazy-created when user opens "Manage People"
+        self._latest_frame_bgr: np.ndarray | None = None  # last raw frame, for capture
         self._output_win = OutputWindow()
         self._diag_win = DiagnosticsWindow(show_overlays=self._state.show_diagnostics)
         self._diag_win.overlays_changed.connect(self._on_diagnostics_changed)
-        self._video_thread = VideoThread(self._state)
+        self._video_thread = VideoThread(self._state, profile_store=self._profile_store)
         self._video_thread.frame_ready.connect(self._on_frame)
         self._video_thread.diag_frame_ready.connect(self._diag_win.update_video)
         self._video_thread.camera_info.connect(self._on_camera_info)
@@ -1197,6 +1331,9 @@ class ControlWindow(QMainWindow):
         btn_diag = QPushButton("Open Diagnostics")
         btn_diag.clicked.connect(self._open_diagnostics)
         btn_row.addWidget(btn_diag)
+        btn_people = QPushButton("Manage People")
+        btn_people.clicked.connect(self._open_people)
+        btn_row.addWidget(btn_people)
         layout.addLayout(btn_row)
 
         # Foreground exclusion zone slider
@@ -1363,10 +1500,27 @@ class ControlWindow(QMainWindow):
         self._diag_win.show()
         self._diag_win.raise_()
 
+    def _open_people(self):
+        if self._people_win is None:
+            from people_ui import PeopleWindow
+            self._people_win = PeopleWindow(
+                self._profile_store,
+                frame_grabber=self._video_thread.grab_latest_frame,
+                parent=self,
+            )
+            # Tell the video thread to rebuild its embedding index whenever
+            # the profile set changes (add/edit/delete/re-embed).
+            self._people_win.profiles_changed.connect(self._video_thread.reindex_profiles)
+        self._people_win.show()
+        self._people_win.raise_()
+        self._people_win.activateWindow()
+
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
         self._video_thread.stop()
         self._output_win.close()
         self._diag_win.close()
+        if self._people_win is not None:
+            self._people_win.close()
         event.accept()

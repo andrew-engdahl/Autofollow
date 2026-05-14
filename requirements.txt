@@ -3,3 +3,5 @@ mediapipe==0.10.30
 numpy>=1.24.3
 ultralytics>=8.0.0
 PyQt5>=5.15.0
+insightface>=0.7.3
+onnxruntime>=1.17.0

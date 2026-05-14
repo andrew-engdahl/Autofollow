@@ -3,7 +3,7 @@
 import time
 import cv2
 import numpy as np
-from tracker import TrackedPerson
+from tracker import TrackedPerson, priority_weight
 from config import SWITCH_MODE, SWITCH_TRIGGER, SWITCH_INTERVAL, CROSSFADE_DURATION, SWITCHER_MIN_DISPLACEMENT_RATIO
 
 # Seconds to warm up the pending person's smoother before committing to the transition.
@@ -125,8 +125,20 @@ class VirtualSwitcher:
             self._manual_request = None
 
         if target is None and self.trigger == 'time':
-            if now - self._last_switch_time >= self.interval and len(persons) > 1:
-                # Cycle to the next person in the list
+            # High-priority active subjects get a longer effective dwell so the
+            # switcher stays on (e.g.) the pastor longer than on a singer or reader.
+            # Priority biases *how long* we stay on a subject — it never gates
+            # whether unmatched people (guest speakers, etc.) are eligible.
+            active_p = next((p for p in persons if p.id == self.active_id), None)
+            active_prio = active_p.profile_priority if active_p else 0
+            effective_interval = self.interval * priority_weight(active_prio)
+
+            if now - self._last_switch_time >= effective_interval and len(persons) > 1:
+                # Cycle to the next person in tracker order — visits every
+                # detected subject regardless of profile match status. Combined
+                # with the priority-scaled dwell above this means priority
+                # people get more *total* airtime per cycle without ever
+                # excluding unmatched guests from the rotation.
                 try:
                     current_idx = ids.index(self.active_id)
                     target = ids[(current_idx + 1) % len(ids)]

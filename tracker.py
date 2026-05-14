@@ -18,6 +18,19 @@ _CENTER_DIST_FALLBACK = 0.25   # fraction of frame diagonal — generous to hand
 
 _FG_SCORE_EMA_ALPHA = 0.15   # heavy smoothing on bbox-area score to prevent fg_ratio oscillation
 
+
+def priority_weight(priority: int) -> float:
+    """Score multiplier from a profile's priority (0–10).
+
+    priority  0 -> 1.0  (no boost — same as an unmatched person)
+    priority  5 -> 2.0
+    priority 10 -> 3.0
+
+    Used to bias candidate selection toward higher-priority profiles in both
+    primary-focus and time-switcher modes.
+    """
+    return 1.0 + max(0, min(10, int(priority))) / 5.0
+
 @dataclass
 class TrackedPerson:
     id: str                          # 'person1', 'person2', …
@@ -27,6 +40,12 @@ class TrackedPerson:
     foreground_score: float = 0.0    # EMA-smoothed bbox_area / frame_area — larger = closer
     activity_score: float = 0.0      # EMA-smoothed weighted center displacement
     frames_unseen: int = 0
+    # Face-recognition match (populated by FaceRecognizer via PersonTracker.set_profile_match)
+    profile_id: str | None = None    # ID of matched People profile, if any
+    profile_name: str | None = None  # display name of matched profile
+    profile_priority: int = 0        # 0–10 priority of matched profile
+    profile_score: float = 0.0       # cosine similarity at last match
+    frames_since_face: int = 999     # frames since the face was last matched (high = stale)
 
 
 def _iou(a, b):
@@ -115,6 +134,7 @@ class PersonTracker:
         # Increment unseen counter for all existing tracks
         for t in self._tracks.values():
             t.frames_unseen += 1
+            t.frames_since_face += 1
 
         # Matching: build a full IoU matrix, then greedily assign best pairs
         # (highest IoU first) to reduce the "greedy order" artifacts where a
@@ -242,6 +262,67 @@ class PersonTracker:
 
         return sorted(self._tracks.values(),
                       key=lambda t: t.foreground_score, reverse=True)
+
+    # ------------------------------------------------------------------
+    # Face-recognition match plumbing
+    # ------------------------------------------------------------------
+
+    # Stale matches are cleared after this many frames without re-confirmation.
+    # At ~5fps face recognition cadence and 30fps capture, ~5s is a comfortable hold.
+    _FACE_MATCH_STALE_FRAMES = 150
+
+    def set_profile_match(self, person_id: str, profile_id: str | None,
+                          profile_name: str | None, priority: int,
+                          score: float):
+        """Attach (or clear) a face-recognition match to a tracked person."""
+        track = self._tracks.get(person_id)
+        if track is None:
+            return
+        track.profile_id = profile_id
+        track.profile_name = profile_name
+        track.profile_priority = int(priority)
+        track.profile_score = float(score)
+        track.frames_since_face = 0
+
+    def expire_stale_face_matches(self):
+        """Forget profile matches that haven't been re-confirmed recently."""
+        for t in self._tracks.values():
+            if (t.profile_id is not None
+                    and t.frames_since_face > self._FACE_MATCH_STALE_FRAMES):
+                t.profile_id = None
+                t.profile_name = None
+                t.profile_priority = 0
+                t.profile_score = 0.0
+
+    def find_by_face_bbox(self, face_bbox: tuple[int, int, int, int],
+                          frame_shape: tuple) -> str | None:
+        """Locate the tracked person whose body contains the given face bbox.
+
+        The match heuristic is: the face center must lie inside a tracked
+        body bbox, *and* be in the upper 60% of that body bbox (faces are
+        above the waist). Ties are broken by smaller body bbox area —
+        nearer person occluding background.
+        """
+        fx1, fy1, fx2, fy2 = face_bbox
+        fcx = (fx1 + fx2) / 2.0
+        fcy = (fy1 + fy2) / 2.0
+        candidates: list[tuple[float, str]] = []
+        for tid, track in self._tracks.items():
+            bx1, by1, bx2, by2 = track.bbox
+            if not (bx1 <= fcx <= bx2):
+                continue
+            if not (by1 <= fcy <= by2):
+                continue
+            # Face must be in the upper portion of the body bbox
+            upper_limit = by1 + (by2 - by1) * 0.6
+            if fcy > upper_limit:
+                continue
+            area = max(1.0, (bx2 - bx1) * (by2 - by1))
+            candidates.append((area, tid))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
 
     def get_primary(self) -> TrackedPerson | None:
         """Return the most-foreground (largest bbox) tracked person."""

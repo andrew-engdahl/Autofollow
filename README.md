@@ -12,6 +12,9 @@ A macOS application that intelligently crops video from a camera device using AI
 - **Live preview** with pose detection visualization
 - **Video output** export to MP4 file format
 - **Multi-camera support** for different camera devices
+- **People profiles** — save reference images of named individuals; InsightFace
+  matches them on-camera and biases the auto-switcher toward higher-priority
+  people (e.g. the pastor at a church)
 
 ## Requirements
 
@@ -220,9 +223,27 @@ Edit config values while running to experiment:
 - Pose detection confidence varies with lighting and body position
 - Video output limited to approximately 1080p resolution
 
+## People Profiles
+
+Click **Manage People** in the Output section to open the profiles window.
+
+1. Click **Add Person…**.
+2. Enter a name and a priority (0–10). Higher priority = the auto-switcher
+   prefers and dwells longer on this person.
+3. Add reference images either from disk (**Add from file…**) or by snapping
+   the current camera frame (**Capture from camera**).
+4. Save. The first profile triggers a one-time download of the InsightFace
+   `buffalo_l` model (~300 MB) to `~/.insightface/models/`.
+
+Once a profile is embedded, the diagnostics overlay shows the matched name
+(e.g. `★8 Pastor Mike`) on the body bbox in place of `personN`.
+
+Profiles, images, and embeddings live in
+`~/Library/Application Support/Autofollow/profiles/`.
+
 ## Future Enhancements
 
-- [ ] Multi-person tracking with person selection
+- [ ] Audio capture + speaker recognition (give known voices switcher priority)
 - [ ] GPU acceleration with CoreML
 - [ ] Face detection for better head positioning  
 - [ ] Custom framing presets (tight close-up, medium shot, wide shot)
