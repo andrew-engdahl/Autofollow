@@ -9,7 +9,7 @@ A macOS application that turns a fixed wide camera into a virtual PTZ camera. It
 - **Virtual switcher** — rotates between people on a timer, or on demand with per-person buttons
 - **Cut or crossfade** transitions, with a pre-travel phase so the camera is already settled on the new subject
 - **Shot types** — Full Body, Waist Up, Medium, Close-Up — computed from actual body landmarks
-- **Smooth camera movement** — deadzone, eased panning, heavily damped tilt and zoom
+- **Smooth camera movement** — per-axis deadzones, eased panning, and zooms that stay locked on the destination instead of drifting and re-panning
 - **Audience exclusion zone** to ignore people standing in front of the stage
 - **Fullscreen output** on any connected display; settings remembered between launches
 - **Diagnostics window** with color-coded skeleton preview, per-person scores, and a switch-event log
@@ -47,27 +47,28 @@ The panel shows up immediately; the pose model loads in the background and the s
 
 ### Control panel
 
+The panel is a single dark window: the program monitor and device pickers on the left, and how the camera behaves on the right. The header holds **Diagnostics**, **People** and **Go Fullscreen**.
+
 | Section | What it does |
 |---------|--------------|
-| **Camera** | Choose the input device. *Refresh* rescans without interrupting the live camera. |
-| **Shot Type** | Full Body / Waist Up / Medium / Close-Up. |
-| **Mode** | *Disabled* shows the whole frame. *Primary* follows the closest person. *Time* rotates between people every N seconds. *Manual* switches only when you press a person button. |
-| **Transition** | Cut or Crossfade, with fade duration. Used for every subject change, including Primary hand-offs. |
-| **Display / Fullscreen** | Pick a display and open the program output fullscreen there. Esc, Q, or a double-click on the output closes it. |
-| **Audience Exclusion** | Ignore anyone whose torso is in the bottom N% of the frame. The zone is drawn in yellow in Diagnostics. |
-| **Max Tracked Persons** | Cap on simultaneously tracked people. |
-| **Audio** | Enable analysis of a microphone input for speaker recognition and music detection (needs the recognition extras). |
-| **Manage People** | Enroll people by face and voice and set their priority. |
+| **Monitor** | The program output, with a live strip underneath: LIVE / NO SIGNAL, fps, how many people are tracked, who is active, and the audio state (off / speech / music / recognized speaker). |
+| **Devices → Camera** | Choose the input device. *⟳* rescans without interrupting the live camera; the label shows the mode it opened at. |
+| **Devices → Audio** | Tick to analyze a microphone input for speaker recognition and music detection (needs the recognition extras). |
+| **Devices → Output** | The display used for fullscreen output. |
+| **Follow mode** | *Off* shows the whole frame. *Primary* follows the closest person. *Timed* rotates between people every N seconds. *Manual* switches only when you press a person chip. |
+| **Framing** | Shot: Full Body / Waist Up / Medium / Close-Up. Transition: Cut or Crossfade, with the fade time. Used for every subject change, including Primary hand-offs. |
+| **Tracking** | *Audience exclusion* ignores anyone whose torso is in the bottom N% of the frame (drawn in yellow in Diagnostics). *Max people* caps how many are tracked at once. |
+| **Go Fullscreen** | Opens the program output fullscreen on the chosen display. Esc, Q, or a double-click on the output closes it. |
 
 All of these are saved and restored on the next launch (the audio device is remembered by name).
 
 ### Diagnostics
 
-*Open Diagnostics* shows the raw camera view with skeletons, bounding boxes, the primary indicator and the exclusion zone; a per-person table of the scores that drive switching; and a log of every switch and why it happened. The overlay is only rendered while the window is open, so leaving it closed costs nothing.
+**Diagnostics** opens a second window built around a large camera view with skeletons, bounding boxes, the primary indicator and the exclusion zone. Beside it, the *Subject* card shows who is active and pending, the phase (steady / pretravel / crossfade / searching) and a dwell bar that turns green once a hand-off is allowed; the *Audio* card shows speech/music scores and the recognized speaker. Below are the per-person table of the scores that drive switching (a `!` marks a value that would trigger a hand-off) and a log of every switch and why it happened. The three regions are separated by draggable splitters. The overlay is only rendered while the window is open, so leaving it closed costs nothing.
 
 ### People profiles (optional)
 
-**Manage People** opens the profile window.
+**People** opens the profile window.
 
 1. **Add Person…**, enter a name and a priority (0–10). Higher priority means the auto-switcher prefers this person and dwells on them longer; 0 behaves like an unknown person.
 2. Add reference photos from disk or **Capture from camera**. Saving embeds them (the first time downloads the InsightFace `buffalo_l` models, ~300 MB, to `~/.insightface/models/`).
@@ -79,7 +80,7 @@ Profiles live in `~/Library/Application Support/Autofollow/profiles/`.
 
 ### Audio (optional)
 
-Tick **Enabled** in the Audio section and pick an input. While on:
+Tick **Audio** in the Devices card and pick an input. While on:
 
 - A recognized enrolled voice gives that tracked person a +5 priority boost for ~3 s.
 - Sustained music (≥5 s) with no recognized speaker switches to **music mode**: Primary follows the most active performer, the time switcher halves its interval and picks by activity. Speech, or any recognized voice, exits music mode.
@@ -98,7 +99,7 @@ Tick **Enabled** in the Audio section and pick an input. While on:
 1. **Detect** — YOLOv8-Pose runs every `DETECTION_INTERVAL` frames on a downscaled copy of the input and returns 17 COCO keypoints per person. People with no visible hips (typically foreground audience cut off at the waist) are ignored.
 2. **Track** — Detections are matched to existing tracks by IoU, with a center-distance fallback for fast movers, giving each person a stable ID. Tracks expire after `TRACK_DROPOUT_SECONDS` unseen. Each track carries an EMA-smoothed *foreground score* (bbox area) and *activity score* (torso movement).
 3. **Frame** — For the chosen shot type, the zoom is computed from the head and the shot's bottom landmark (hips, knees, ankles…) so the framing is consistent regardless of how far away the person is. Zoom is bounded between "the whole camera frame" and `MAX_ZOOM`.
-4. **Smooth** — A per-subject PTZ smoother applies a horizontal deadzone, quadratic ease-out panning, and slow tilt/zoom, all capped by `MAX_*_SPEED`.
+4. **Smooth** — A per-subject PTZ smoother tracks the crop *center* and zoom (never the crop origin), so a zoom grows or shrinks around a fixed point. Pan has a soft deadzone with quadratic ease-out; tilt and zoom have their own deadzones so keypoint noise never makes the shot creep or breathe. While the zoom is moving, the center is forced to converge at least as fast as the zoom, so every push-in or pull-out stays centered on the destination and arrives with no trailing pan or tilt. All axes are capped by `MAX_*_SPEED`.
 5. **Switch** — In Primary mode a hand-off needs the candidate to be ≥1.5× larger or ≥2× more active, and only after `PRIMARY_DWELL_SECONDS`. Profile priority shifts that threshold (a higher-priority person who is at least as close takes over immediately; a lower-priority one must be much closer) but never stops an unknown person who is clearly nearer. If the subject disappears, the camera holds and slowly widens; after `PRIMARY_REACQUIRE_DELAY` the best remaining person is adopted with the configured transition.
 
 ## Configuration
@@ -162,7 +163,7 @@ Autofollow/
 ├── pose_detector.py       # YOLOv8-Pose wrapper
 ├── tracker.py             # Multi-person tracking with stable IDs
 ├── framing_engine.py      # Shot-type framing and crop
-├── smoothing.py           # PTZ smoothing / deadzone
+├── smoothing.py           # Center-based PTZ smoothing, deadzones, zoom-locked centering
 ├── switcher.py            # Virtual switcher state machine
 ├── profiles.py            # People profile store (faces, voices, priority)
 ├── face_recognizer.py     # InsightFace wrapper (shared instance)
@@ -171,7 +172,9 @@ Autofollow/
 ├── audio_thread.py        # VAD + speaker recognition + music-mode state machine
 ├── audio_classifier.py    # YAMNet music/speech scores
 ├── speaker_recognizer.py  # SpeechBrain ECAPA wrapper (shared instance)
-├── people_ui.py           # Manage People window
+├── people_ui.py           # People window
+├── theme.py               # Dark theme, stylesheet and shared widgets
+├── splash.py              # Launch splash
 ├── config.py              # Defaults
 ├── make_icon.py           # Generates AppIcon.icns for the bundle
 ├── requirements.txt       # Core dependencies

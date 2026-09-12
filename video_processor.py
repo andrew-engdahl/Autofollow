@@ -48,6 +48,7 @@ class VideoProcessor:
         self.input_width = w
         self.input_height = h
         self._framing = FramingEngine(w, h)
+        self._smoother.set_bounds(w, h)
 
         print(f"Camera: {w}×{h} @ {fps:.1f} fps")
 
@@ -89,11 +90,7 @@ class VideoProcessor:
         else:
             primary = persons[0]
             tx, ty, tz = self._framing.calculate_target(primary)
-            cx = (primary.bbox[0] + primary.bbox[2]) / 2.0
-            cw = OUTPUT_WIDTH / tz
-            sx, sy, sz = self._smoother.update(
-                'primary', tx, ty, tz, person_center_x=cx, crop_width=cw
-            )
+            sx, sy, sz = self._smoother.update('primary', tx, ty, tz)
         return self._framing.apply_crop(frame, sx, sy, sz), \
                persons[0].id if persons else 'none'
 

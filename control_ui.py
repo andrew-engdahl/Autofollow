@@ -8,12 +8,12 @@ import numpy as np
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QPushButton, QRadioButton, QButtonGroup,
-    QGroupBox, QDoubleSpinBox, QSpinBox, QSlider, QCheckBox,
-    QTableWidget, QTableWidgetItem, QTextEdit, QHeaderView,
+    QLabel, QComboBox, QPushButton, QDoubleSpinBox, QSpinBox, QSlider,
+    QCheckBox, QTableWidget, QTableWidgetItem, QTextEdit, QHeaderView,
+    QSplitter, QProgressBar, QFrame,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker, QSettings
-from PyQt5.QtGui import QImage, QPixmap, QFont, QColor
+from PyQt5.QtGui import QImage, QFont, QColor
 
 import config
 from camera import scan_cameras, open_capture, describe_capture
@@ -25,6 +25,10 @@ from profiles import ProfileStore
 from audio_thread import AudioThread, SPEAKER_BOOST_HOLD_S
 from audio_capture import list_input_devices
 from face_worker import FaceRecognitionWorker
+from theme import (
+    Card, Segmented, VideoSurface, Dot, pill, set_pill,
+    ACCENT, GREEN, RED, AMBER, PURPLE, CYAN, MUTED, DIM, BORDER,
+)
 
 
 # Hand a frame to the face-recognition worker at most every N captured frames
@@ -97,10 +101,6 @@ def _bgr_to_qimage(frame: np.ndarray) -> QImage:
         return QImage(frame.data, w, h, ch * w, QImage.Format_BGR888).copy()
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
-
-
-def _bbox_center_x(person) -> float:
-    return (person.bbox[0] + person.bbox[2]) / 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +428,7 @@ class VideoThread(QThread):
             return
         w, h, fps = describe_capture(self._cap)
         self._framing = FramingEngine(w, h)
+        self._smoother.set_bounds(w, h)
         self.camera_info.emit(f"{w}×{h} @ {fps:.0f} fps")
         self.status.emit(f"Camera {index} ready")
 
@@ -727,11 +728,7 @@ class VideoThread(QThread):
     def _follow(self, key: str, person, shot_type: str) -> tuple[float, float, float]:
         """Advance smoother `key` toward `person`'s framing target; return (x, y, zoom)."""
         tx, ty, tz = self._framing.calculate_target(person, shot_type)
-        return self._smoother.update(
-            key, tx, ty, tz,
-            person_center_x=_bbox_center_x(person),
-            crop_width=config.OUTPUT_WIDTH / tz,
-        )
+        return self._smoother.update(key, tx, ty, tz)
 
     def _held(self, key: str) -> tuple[float, float, float]:
         s = self._smoother.get_state(key)
@@ -827,20 +824,7 @@ class VideoThread(QThread):
 
     def _search_zoom_out(self):
         """Nudge the held camera wider, keeping the crop centered on the same spot."""
-        state = self._smoother.get_state('primary')
-        old_zoom = state['zoom']
-        new_zoom = max(self._framing.min_zoom, old_zoom - _SEARCH_ZOOM_OUT_RATE)
-        if new_zoom == old_zoom:
-            return
-        new_w = config.OUTPUT_WIDTH / new_zoom
-        new_h = config.OUTPUT_HEIGHT / new_zoom
-        x = state['x'] - (new_w - config.OUTPUT_WIDTH / old_zoom) / 2.0
-        y = state['y'] - (new_h - config.OUTPUT_HEIGHT / old_zoom) / 2.0
-        # Keep the stored position inside the frame so the next pan starts moving
-        # immediately instead of first "travelling" through clamped-off space.
-        state['x'] = min(max(0.0, x), max(0.0, self._framing.input_width - new_w))
-        state['y'] = min(max(0.0, y), max(0.0, self._framing.input_height - new_h))
-        state['zoom'] = new_zoom
+        self._smoother.widen('primary', _SEARCH_ZOOM_OUT_RATE, self._framing.min_zoom)
 
     def _render_primary(self, frame, persons, shot_type, settings: dict):
         """Track the nearest (largest bbox) person as primary.
@@ -1005,123 +989,233 @@ _DIAG_TABLE_INTERVAL = 0.1  # seconds between table/label refreshes (log is per-
 class DiagnosticsWindow(QMainWindow):
     """Floating panel showing live tracking state and a switch-event log.
 
+    Layout: a large annotated camera view with a slim state column beside it,
+    and the per-person table + switch log below.  All three regions sit in
+    splitters so the operator can give the video (or the table) more room.
+
     Updated every frame via update_diagnostics(); never touches the video thread.
     """
 
     overlays_changed = pyqtSignal(bool)     # emitted when "Show Overlays" is toggled
     visibility_changed = pyqtSignal(bool)   # emitted on show / hide / close
 
+    _TABLE_COLUMNS = (
+        ("",         "Skeleton colour in the camera view; ▶ marks the active subject"),
+        ("Person",   "Track ID, and the enrolled profile it was matched to"),
+        ("Face",     "Recognised profile ★priority (cosine similarity)"),
+        ("Voice",    "Temporary priority boost while this person's voice is recognised"),
+        ("Size",     "Smoothed foreground score (bounding-box area)"),
+        ("Activity", "Smoothed torso-movement score"),
+        ("Size ×",   "Size relative to the active subject — ! when it would trigger a hand-off (≥1.5)"),
+        ("Act ×",    "Activity relative to the active subject — ! when it would trigger a hand-off (≥2.0)"),
+        ("Unseen",   "Frames since this track was last detected"),
+        ("Centre",   "Bounding-box centre in source pixels"),
+        ("Zoom",     "This subject's smoothed virtual-camera zoom"),
+    )
+
     def __init__(self, show_overlays: bool = True, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Autofollow Diagnostics")
-        self.setMinimumSize(640, 640)
+        self.setWindowTitle("Autofollow — Diagnostics")
+        self.setMinimumSize(900, 620)
+        self.resize(1200, 820)
         self._last_active_id: str | None = None   # for detecting new switch events
         self._last_table_update: float = 0.0
 
         root = QWidget()
+        root.setObjectName("root")
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
-        layout.setSpacing(6)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(10)
 
-        # ── Show Overlays checkbox ───────────────────────────────────────
-        overlay_row = QHBoxLayout()
-        self._overlay_checkbox = QCheckBox("Show Overlays")
+        # ── Toolbar: overlays toggle, live pills, perf readouts ───────────
+        bar = QHBoxLayout()
+        bar.setSpacing(12)
+        self._overlay_checkbox = QCheckBox("Show overlays")
         self._overlay_checkbox.setChecked(show_overlays)
         self._overlay_checkbox.setToolTip(
-            "Draw skeletons, bounding boxes and the exclusion zone on the camera preview.")
+            "Draw skeletons, bounding boxes and the exclusion zone on the camera view.")
         self._overlay_checkbox.stateChanged.connect(
-            lambda state: self.overlays_changed.emit(bool(state))
-        )
-        overlay_row.addWidget(self._overlay_checkbox)
-        overlay_row.addStretch()
-        layout.addLayout(overlay_row)
+            lambda state: self.overlays_changed.emit(bool(state)))
+        bar.addWidget(self._overlay_checkbox)
+        bar.addSpacing(8)
+        self._pill_mode = pill("—")
+        self._pill_phase = pill("—")
+        bar.addWidget(self._pill_mode)
+        bar.addWidget(self._pill_phase)
+        bar.addStretch()
+        self._lbl_fps = self._readout(bar, "fps")
+        self._lbl_face_ms = self._readout(bar, "face")
+        layout.addLayout(bar)
 
-        # ── Video preview (raw input with color-coded overlays) ──────────
-        self._video_label = QLabel()
-        self._video_label.setAlignment(Qt.AlignCenter)
-        self._video_label.setMinimumSize(320, 180)
-        self._video_label.setStyleSheet("background: #111; border: 1px solid #333;")
-        self._video_label.setSizePolicy(
-            self._video_label.sizePolicy().Expanding,
-            self._video_label.sizePolicy().Expanding,
-        )
-        layout.addWidget(self._video_label, stretch=3)
+        # ── Top: video + side column ─────────────────────────────────────
+        self._vsplit = QSplitter(Qt.Vertical)
+        self._vsplit.setChildrenCollapsible(False)
+        layout.addWidget(self._vsplit, stretch=1)
 
-        # ── State summary row ────────────────────────────────────────────
-        state_box = QGroupBox("Tracking State")
-        state_grid = QHBoxLayout(state_box)
+        top = QSplitter(Qt.Horizontal)
+        top.setChildrenCollapsible(False)
+        self._video = VideoSurface(radius=12, background="#0b0d11")
+        self._video.set_placeholder("Waiting for camera…")
+        self._video.setMinimumSize(480, 270)
+        top.addWidget(self._video)
 
-        self._lbl_mode     = self._make_field("Mode", state_grid)
-        self._lbl_active   = self._make_field("Active", state_grid)
-        self._lbl_pending  = self._make_field("Pending", state_grid)
-        self._lbl_phase    = self._make_field("Phase", state_grid)
-        self._lbl_dwell    = self._make_field("Dwell", state_grid)
-        self._lbl_fps      = self._make_field("FPS", state_grid)
-        self._lbl_face_ms  = self._make_field("Face", state_grid)
-        layout.addWidget(state_box)
+        side = QWidget()
+        side_lay = QVBoxLayout(side)
+        side_lay.setContentsMargins(0, 0, 0, 0)
+        side_lay.setSpacing(10)
+        side.setMinimumWidth(250)
+        side.setMaximumWidth(360)
 
-        # ── Audio state row ──────────────────────────────────────────────
-        audio_box = QGroupBox("Audio")
-        audio_grid = QHBoxLayout(audio_box)
-        self._lbl_audio_mode    = self._make_field("Mode", audio_grid)
-        self._lbl_audio_speaker = self._make_field("Speaker", audio_grid)
-        self._lbl_audio_scores  = self._make_field("Music/Speech", audio_grid)
-        layout.addWidget(audio_box)
+        # Subject card
+        subj = Card("Subject")
+        self._lbl_active = QLabel("—")
+        self._lbl_active.setObjectName("value")
+        self._lbl_active.setStyleSheet("font-size: 20px; font-weight: 700;")
+        subj.body.addWidget(self._lbl_active)
+        self._lbl_pending = self._kv(subj, "Pending")
+        self._lbl_mode = self._kv(subj, "Mode")
+        self._lbl_phase = self._kv(subj, "Phase")
+        dwell_hdr = QHBoxLayout()
+        dl = QLabel("Dwell")
+        dl.setObjectName("fieldLabel")
+        self._lbl_dwell = QLabel("—")
+        self._lbl_dwell.setObjectName("mono")
+        dwell_hdr.addWidget(dl)
+        dwell_hdr.addStretch()
+        dwell_hdr.addWidget(self._lbl_dwell)
+        subj.body.addLayout(dwell_hdr)
+        self._dwell_bar = self._bar()
+        subj.body.addWidget(self._dwell_bar)
+        self._lbl_gate = QLabel("hand-off gate closed")
+        self._lbl_gate.setObjectName("dim")
+        subj.body.addWidget(self._lbl_gate)
+        side_lay.addWidget(subj)
 
-        # ── Per-person table ─────────────────────────────────────────────
-        persons_box = QGroupBox("Tracked Persons")
-        persons_layout = QVBoxLayout(persons_box)
-        self._table = QTableWidget(0, 11)
-        self._table.setHorizontalHeaderLabels(
-            ["", "ID / Profile", "Face", "Voice",
-             "FG(sm)", "Act(sm)", "FG Ratio", "Act Ratio",
-             "Unseen", "Center X,Y", "Zoom(sm)"]
-        )
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        # Audio card
+        audio = Card("Audio")
+        mode_row = QHBoxLayout()
+        ml = QLabel("Mode")
+        ml.setObjectName("fieldLabel")
+        self._lbl_audio_mode = pill("off")
+        mode_row.addWidget(ml)
+        mode_row.addStretch()
+        mode_row.addWidget(self._lbl_audio_mode)
+        audio.body.addLayout(mode_row)
+        self._lbl_audio_speaker = self._kv(audio, "Speaker")
+        self._lbl_music_score = self._kv(audio, "Music")
+        self._music_bar = self._bar(PURPLE)
+        audio.body.addWidget(self._music_bar)
+        self._lbl_speech_score = self._kv(audio, "Speech")
+        self._speech_bar = self._bar(GREEN)
+        audio.body.addWidget(self._speech_bar)
+        side_lay.addWidget(audio)
+        side_lay.addStretch()
+        top.addWidget(side)
+        top.setStretchFactor(0, 1)
+        top.setStretchFactor(1, 0)
+        self._vsplit.addWidget(top)
+
+        # ── Bottom: people table + switch log ────────────────────────────
+        bottom = QSplitter(Qt.Vertical)
+        bottom.setChildrenCollapsible(False)
+
+        persons_card = Card("Tracked people", spacing=6)
+        self._table = QTableWidget(0, len(self._TABLE_COLUMNS))
+        self._table.setHorizontalHeaderLabels([c[0] for c in self._TABLE_COLUMNS])
+        for i, (_, tip) in enumerate(self._TABLE_COLUMNS):
+            self._table.horizontalHeaderItem(i).setToolTip(tip)
+        hdr = self._table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        hdr.setStretchLastSection(False)
+        hdr.setHighlightSections(False)
+        self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(26)
+        self._table.setShowGrid(False)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionMode(QTableWidget.NoSelection)
-        self._table.setFixedHeight(150)
-        persons_layout.addWidget(self._table)
-        layout.addWidget(persons_box)
+        self._table.setFocusPolicy(Qt.NoFocus)
+        self._table.setMinimumHeight(150)
+        self._table.setFont(QFont("Menlo", 11))
+        persons_card.body.addWidget(self._table)
+        bottom.addWidget(persons_card)
 
-        # ── Switch event log ─────────────────────────────────────────────
-        log_box = QGroupBox("Switch Event Log")
-        log_layout = QVBoxLayout(log_box)
+        log_card = Card("Switch log", spacing=6)
+        btn_clear = QPushButton("Clear")
+        btn_clear.setObjectName("ghost")
+        btn_clear.setCursor(Qt.PointingHandCursor)
+        log_card.header.addWidget(btn_clear)
         self._log = QTextEdit()
         self._log.setReadOnly(True)
-        self._log.setFont(QFont("Menlo", 10))
-        self._log.setStyleSheet("background:#1e1e1e; color:#d4d4d4;")
-        log_layout.addWidget(self._log)
-
-        btn_clear = QPushButton("Clear Log")
-        btn_clear.setFixedWidth(90)
+        self._log.setFont(QFont("Menlo", 11))
+        self._log.setMinimumHeight(80)
+        self._log.setFrameShape(QFrame.NoFrame)
         btn_clear.clicked.connect(self._log.clear)
-        log_layout.addWidget(btn_clear, alignment=Qt.AlignRight)
-        layout.addWidget(log_box)
+        log_card.body.addWidget(self._log)
+        bottom.addWidget(log_card)
+        bottom.setSizes([210, 150])
+        self._vsplit.addWidget(bottom)
+        self._vsplit.setStretchFactor(0, 3)
+        self._vsplit.setStretchFactor(1, 2)
+        self._vsplit.setSizes([520, 300])
 
+    # ------------------------------------------------------------------
+    # Small builders
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _make_field(label: str, row: QHBoxLayout) -> QLabel:
-        """Add a label+value pair to a horizontal layout; return the value label."""
-        lbl = QLabel(f"{label}:")
-        lbl.setStyleSheet("font-weight: bold;")
+    def _kv(card: Card, label: str) -> QLabel:
+        """Label / value line inside a card; returns the value label."""
+        row = QHBoxLayout()
+        lbl = QLabel(label)
+        lbl.setObjectName("fieldLabel")
         val = QLabel("—")
-        val.setMinimumWidth(70)
+        val.setObjectName("mono")
+        val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         row.addWidget(lbl)
+        row.addStretch()
         row.addWidget(val)
+        card.body.addLayout(row)
         return val
+
+    @staticmethod
+    def _readout(row: QHBoxLayout, unit: str) -> QLabel:
+        """'— fps' style readout on the toolbar; returns the value label."""
+        val = QLabel("—")
+        val.setObjectName("mono")
+        unit_lbl = QLabel(unit)
+        unit_lbl.setObjectName("dim")
+        row.addWidget(val)
+        row.addWidget(unit_lbl)
+        row.addSpacing(6)
+        return val
+
+    @staticmethod
+    def _bar(color: str = ACCENT) -> QProgressBar:
+        bar = QProgressBar()
+        bar.setRange(0, 1000)
+        bar.setValue(0)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(6)
+        DiagnosticsWindow._tint_bar(bar, color)
+        return bar
+
+    @staticmethod
+    def _tint_bar(bar: QProgressBar, color: str):
+        if bar.property("tint") == color:
+            return
+        bar.setProperty("tint", color)
+        bar.setStyleSheet(
+            f"QProgressBar {{ background: {BORDER}; border: none; border-radius: 3px; }}"
+            f"QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}")
 
     # ------------------------------------------------------------------
 
     def update_video(self, qimg: QImage):
-        """Display a new annotated frame in the diagnostics video preview."""
-        if not self.isVisible():
-            return
-        pix = QPixmap.fromImage(qimg)
-        self._video_label.setPixmap(
-            pix.scaled(self._video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
+        """Display a new annotated frame in the diagnostics camera view."""
+        if self.isVisible():
+            self._video.set_image(qimg)
 
     # ------------------------------------------------------------------
 
@@ -1164,43 +1258,8 @@ class DiagnosticsWindow(QMainWindow):
         now = time.monotonic()
         if self.isVisible() and now - self._last_table_update >= _DIAG_TABLE_INTERVAL:
             self._last_table_update = now
-            self._lbl_mode.setText(mode)
-            self._lbl_active.setText(primary_id or '—')
-            self._lbl_pending.setText(pending_id or '—')
-            self._lbl_phase.setText(phase)
-            self._lbl_dwell.setText(f"{dwell:.2f}/{dwell_threshold:.1f}s")
-            self._lbl_fps.setText(f"{fps:.1f}")
-            face_ms = meta.get('face_ms', 0.0)
-            self._lbl_face_ms.setText(f"{face_ms:.0f} ms" if face_ms > 0 else "—")
-
-            audio_state = meta.get('audio_state') or {}
-            if audio_state.get('enabled'):
-                music_on = bool(audio_state.get('music_mode'))
-                self._lbl_audio_mode.setText("MUSIC" if music_on else "Speech")
-                self._lbl_audio_mode.setStyleSheet(
-                    "color: #c678dd; font-weight: bold;" if music_on
-                    else "color: #98c379; font-weight: bold;")
-            else:
-                self._lbl_audio_mode.setText("off")
-                self._lbl_audio_mode.setStyleSheet("color: gray;")
-            spk_name = audio_state.get('speaker_name')
-            if spk_name:
-                self._lbl_audio_speaker.setText(
-                    f"● {spk_name} ({audio_state.get('speaker_score', 0.0):.2f})")
-                self._lbl_audio_speaker.setStyleSheet("color: #61afef; font-weight: bold;")
-            else:
-                self._lbl_audio_speaker.setText("—")
-                self._lbl_audio_speaker.setStyleSheet("color: gray;")
-            self._lbl_audio_scores.setText(
-                f"m={audio_state.get('music_score', 0.0):.2f} / "
-                f"s={audio_state.get('speech_score', 0.0):.2f}")
-
-            # Red = gate closed (can't switch yet), green = gate open
-            if not gate_open:
-                self._lbl_dwell.setStyleSheet("color: #e06c75; font-weight: bold;")
-            else:
-                self._lbl_dwell.setStyleSheet("color: #98c379; font-weight: bold;")
-
+            self._refresh_panels(meta, mode, primary_id, pending_id, phase,
+                                 dwell, dwell_threshold, gate_open, fps)
             self._refresh_table(persons, meta.get('person_index_map', {}),
                                 primary_id, pending_id, curr_fg, curr_act, gate_open)
 
@@ -1215,14 +1274,14 @@ class DiagnosticsWindow(QMainWindow):
                 # Show which threshold was met (or neither — means forced recovery)
                 why = []
                 if fg_r >= 1.5:
-                    why.append(f"fg={fg_r:.2f}≥1.5")
+                    why.append(f"size ×{fg_r:.2f}")
                 if nearest['activity'] >= 5.0 and act_r >= 2.0:
-                    why.append(f"act={act_r:.2f}≥2.0")
+                    why.append(f"activity ×{act_r:.2f}")
                 if not why:
                     why.append('reacquired')
                 reason = f"  [{', '.join(why)}]"
-            line = (f"[{ts}]  {self._last_active_id or '—'} → {active_id}"
-                    f"  dwell={dwell:.2f}s{reason}")
+            line = (f"{ts}   {self._last_active_id or '—'}  →  {active_id}"
+                    f"   dwell {dwell:.2f}s{reason}")
             self._log.append(line)
             # Trim to max lines
             doc = self._log.document()
@@ -1234,6 +1293,55 @@ class DiagnosticsWindow(QMainWindow):
                 cursor.deleteChar()   # remove the trailing newline
             self._log.ensureCursorVisible()
         self._last_active_id = active_id
+
+    def _refresh_panels(self, meta, mode, primary_id, pending_id, phase,
+                        dwell, dwell_threshold, gate_open, fps):
+        mode_color = {'primary': ACCENT, 'switcher': CYAN, 'disabled': DIM}.get(mode, MUTED)
+        set_pill(self._pill_mode, mode.upper(), mode_color)
+        phase_color = {'steady': GREEN, 'searching': AMBER, 'pretravel': PURPLE,
+                       'crossfade': PURPLE, 'disabled': DIM}.get(phase, MUTED)
+        set_pill(self._pill_phase, phase, phase_color)
+
+        self._lbl_fps.setText(f"{fps:.1f}")
+        face_ms = meta.get('face_ms', 0.0)
+        self._lbl_face_ms.setText(f"{face_ms:.0f} ms" if face_ms > 0 else "—")
+
+        active_name = primary_id if primary_id not in (None, 'none', 'disabled') else '—'
+        person = next((p for p in meta.get('persons', []) if p['id'] == primary_id), None)
+        if person is not None and person.get('profile_name'):
+            active_name = f"{person['profile_name']}  ·  {primary_id}"
+        self._lbl_active.setText(active_name)
+        self._lbl_pending.setText(pending_id or '—')
+        self._lbl_mode.setText(mode)
+        self._lbl_phase.setText(phase)
+
+        frac = 0.0 if dwell_threshold <= 0 else min(1.0, dwell / dwell_threshold)
+        self._dwell_bar.setValue(int(frac * 1000))
+        self._tint_bar(self._dwell_bar, GREEN if gate_open else RED)
+        self._lbl_dwell.setText(f"{dwell:.1f} / {dwell_threshold:.1f} s")
+        self._lbl_gate.setText("hand-off allowed" if gate_open else "hand-off gate closed")
+
+        audio_state = meta.get('audio_state') or {}
+        if audio_state.get('enabled'):
+            music_on = bool(audio_state.get('music_mode'))
+            set_pill(self._lbl_audio_mode, "MUSIC" if music_on else "SPEECH",
+                     PURPLE if music_on else GREEN)
+        else:
+            set_pill(self._lbl_audio_mode, "OFF", DIM)
+        spk_name = audio_state.get('speaker_name')
+        if spk_name:
+            self._lbl_audio_speaker.setText(
+                f"● {spk_name}  {audio_state.get('speaker_score', 0.0):.2f}")
+            self._lbl_audio_speaker.setStyleSheet(f"color: {ACCENT}; font-weight: 600;")
+        else:
+            self._lbl_audio_speaker.setText("—")
+            self._lbl_audio_speaker.setStyleSheet("")
+        m = float(audio_state.get('music_score', 0.0))
+        s = float(audio_state.get('speech_score', 0.0))
+        self._lbl_music_score.setText(f"{m:.2f}")
+        self._lbl_speech_score.setText(f"{s:.2f}")
+        self._music_bar.setValue(int(max(0.0, min(1.0, m)) * 1000))
+        self._speech_bar.setValue(int(max(0.0, min(1.0, s)) * 1000))
 
     def _refresh_table(self, persons, person_index_map, primary_id, pending_id,
                        curr_fg, curr_act, gate_open):
@@ -1260,11 +1368,6 @@ class DiagnosticsWindow(QMainWindow):
             # Qt fromHsv uses 0-359, so multiply the same step by 2.
             p_idx = person_index_map.get(pid, 0)
             skel_qcolor = QColor.fromHsv(int((p_idx * 275) % 360), 200, 220)
-            swatch_bg = QColor(
-                skel_qcolor.red()   // 4,
-                skel_qcolor.green() // 4,
-                skel_qcolor.blue()  // 4,
-            )
 
             # Column 0: color swatch (solid person color, narrow)
             swatch = QTableWidgetItem()
@@ -1296,28 +1399,34 @@ class DiagnosticsWindow(QMainWindow):
                 voice_cell,
                 f"{fg:.4f}",
                 f"{act:.2f}",
-                f"{'!' if fg_trigger  else ''}{fg_ratio:.2f}",
-                f"{'!' if act_trigger else ''}{act_ratio:.2f}",
+                f"{'! ' if fg_trigger  else ''}{fg_ratio:.2f}",
+                f"{'! ' if act_trigger else ''}{act_ratio:.2f}",
                 str(unseen),
-                f"{cx:.0f},{cy:.0f}",
+                f"{cx:.0f}, {cy:.0f}",
                 f"{sz:.2f}" if sz is not None else "—",
             ]
+            if is_active:
+                row_bg = QColor(GREEN); row_bg.setAlpha(56)
+            elif is_pending:
+                row_bg = QColor(PURPLE); row_bg.setAlpha(56)
+            elif fg_trigger or act_trigger:
+                row_bg = QColor(RED); row_bg.setAlpha(56)
+            else:
+                row_bg = QColor(0, 0, 0, 0)
             for col, text in enumerate(cells, start=1):
                 item = QTableWidgetItem(text)
-                item.setTextAlignment(Qt.AlignCenter)
-                if is_active:
-                    item.setBackground(QColor(40, 80, 40))
-                elif is_pending:
-                    item.setBackground(QColor(80, 60, 20))
-                elif fg_trigger or act_trigger:
-                    item.setBackground(QColor(80, 40, 40))
-                else:
-                    item.setBackground(swatch_bg)
-                item.setForeground(skel_qcolor)
+                item.setTextAlignment(Qt.AlignCenter if col > 1 else Qt.AlignLeft | Qt.AlignVCenter)
+                item.setBackground(row_bg)
+                if col == 1:
+                    item.setForeground(skel_qcolor)
+                elif col in (6, 7) and (fg_trigger if col == 6 else act_trigger):
+                    item.setForeground(QColor(RED))
+                elif text == "—":
+                    item.setForeground(QColor(DIM))
                 self._table.setItem(row, col, item)
 
         # Fix swatch column to a narrow fixed width
-        self._table.setColumnWidth(0, 22)
+        self._table.setColumnWidth(0, 26)
 
     # ------------------------------------------------------------------
 
@@ -1348,16 +1457,12 @@ class OutputWindow(QMainWindow):
         self.setWindowTitle("Autofollow Output")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setCursor(Qt.BlankCursor)
-        self._label = QLabel(self)
-        self._label.setAlignment(Qt.AlignCenter)
-        self._label.setStyleSheet("background: black;")
-        self.setCentralWidget(self._label)
+        self._surface = VideoSurface(radius=0, background="#000000")
+        self._surface.set_placeholder("")
+        self.setCentralWidget(self._surface)
 
     def update_frame(self, qimg: QImage):
-        pix = QPixmap.fromImage(qimg)
-        self._label.setPixmap(
-            pix.scaled(self._label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
+        self._surface.set_image(qimg)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1380,12 +1485,19 @@ class OutputWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 class ControlWindow(QMainWindow):
-    """Main control panel window."""
+    """Main control panel window.
+
+    Left: the program monitor with a live status strip and the device pickers.
+    Right: how the camera behaves — follow mode, framing and tracking limits.
+    """
+
+    _SIDEBAR_WIDTH = 330
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Autofollow")
-        self.setMinimumWidth(340)
+        self.setMinimumSize(880, 600)
+        self.resize(1040, 680)
 
         self._settings = QSettings("Autofollow", "Autofollow")
         self._state = AppState()
@@ -1414,14 +1526,14 @@ class ControlWindow(QMainWindow):
         self._audio_thread.speaker_detected.connect(self._on_speaker_detected)
         self._audio_thread.error.connect(self._on_audio_error)
         self._audio_thread.status.connect(self._on_status)
-        self._audio_status_text = "Audio: off"
+        self._audio_status_text = "Audio off"
 
-        self._preview_label = QLabel()
-        self._preview_label.setAlignment(Qt.AlignCenter)
-        self._preview_label.setMinimumSize(320, 180)
-        self._preview_label.setStyleSheet("background: black;")
+        self._preview = VideoSurface(radius=10, background="#000000")
+        self._preview.set_placeholder("Starting camera…")
+        self._preview.setMinimumSize(400, 225)
 
         self._last_status: str = ""
+        self._last_frame_at: float = 0.0
         self._build_ui()
         self._video_thread.start()
         self._audio_thread.start()
@@ -1438,35 +1550,172 @@ class ControlWindow(QMainWindow):
 
     def _build_ui(self):
         root = QWidget()
+        root.setObjectName("root")
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
-        layout.setSpacing(8)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(12)
 
-        layout.addWidget(self._build_camera_section())
-        layout.addWidget(self._build_audio_section())
-        layout.addWidget(self._build_shot_section())
-        layout.addWidget(self._build_switcher_section())
-        layout.addWidget(self._preview_label)
-        layout.addWidget(self._build_output_section())
+        layout.addLayout(self._build_header())
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+
+        left = QVBoxLayout()
+        left.setSpacing(12)
+        left.addWidget(self._build_monitor_card(), stretch=1)
+        left.addWidget(self._build_devices_card())
+        body.addLayout(left, stretch=1)
+
+        right = QVBoxLayout()
+        right.setSpacing(12)
+        right.addWidget(self._build_mode_card())
+        right.addWidget(self._build_framing_card())
+        right.addWidget(self._build_tracking_card())
+        right.addStretch()
+        side = QWidget()
+        side.setLayout(right)
+        side.setFixedWidth(self._SIDEBAR_WIDTH)
+        body.addWidget(side)
+
+        layout.addLayout(body, stretch=1)
         layout.addWidget(self._build_status_bar())
 
-    # --- Camera ---
+    # --- Header: wordmark + primary actions ---
 
-    def _build_camera_section(self):
-        box = QGroupBox("Camera")
-        row = QHBoxLayout(box)
+    def _build_header(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        mark = QLabel()
+        mark.setFixedSize(26, 26)
+        mark.setStyleSheet(
+            f"background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 {ACCENT}, stop:1 {CYAN});"
+            "border-radius: 7px;")
+        title = QLabel("Autofollow")
+        title.setStyleSheet("font-size: 18px; font-weight: 700; letter-spacing: 0.5px;")
+        row.addWidget(mark)
+        row.addWidget(title)
+        row.addStretch()
+
+        btn_diag = QPushButton("Diagnostics")
+        btn_diag.setObjectName("ghost")
+        btn_diag.setCursor(Qt.PointingHandCursor)
+        btn_diag.setToolTip("Open the live tracking view: skeletons, scores and the switch log.")
+        btn_diag.clicked.connect(self._open_diagnostics)
+        btn_people = QPushButton("People")
+        btn_people.setObjectName("ghost")
+        btn_people.setCursor(Qt.PointingHandCursor)
+        btn_people.setToolTip("Enroll people by face and voice, and set their priority.")
+        btn_people.clicked.connect(self._open_people)
+        self._btn_fullscreen = QPushButton("Go Fullscreen")
+        self._btn_fullscreen.setObjectName("primary")
+        self._btn_fullscreen.setCursor(Qt.PointingHandCursor)
+        self._btn_fullscreen.setToolTip(
+            "Show the program output fullscreen on the selected display.\n"
+            "Press Esc or double-click the output to close it.")
+        self._btn_fullscreen.clicked.connect(self._toggle_fullscreen)
+        row.addWidget(btn_diag)
+        row.addWidget(btn_people)
+        row.addWidget(self._btn_fullscreen)
+        return row
+
+    # --- Monitor: program preview + live status strip ---
+
+    def _build_monitor_card(self) -> Card:
+        card = Card(None, spacing=8)
+        card.layout().setContentsMargins(10, 10, 10, 10)
+        card.body.addWidget(self._preview, stretch=1)
+
+        strip = QHBoxLayout()
+        strip.setSpacing(14)
+        live = QHBoxLayout()
+        live.setSpacing(6)
+        self._live_dot = Dot(DIM)
+        self._live_label = QLabel("STANDBY")
+        self._live_label.setObjectName("cardTitle")
+        live.addWidget(self._live_dot)
+        live.addWidget(self._live_label)
+        strip.addLayout(live)
+
+        self._fps_label = self._strip_stat(strip, "fps")
+        self._tracked_label = self._strip_stat(strip, "tracked")
+        self._active_label = self._strip_stat(strip, "active")
+        strip.addStretch()
+        self._audio_pill = pill("AUDIO OFF", DIM)
+        strip.addWidget(self._audio_pill)
+        card.body.addLayout(strip)
+        return card
+
+    @staticmethod
+    def _strip_stat(row: QHBoxLayout, unit: str) -> QLabel:
+        val = QLabel("—")
+        val.setObjectName("mono")
+        unit_lbl = QLabel(unit)
+        unit_lbl.setObjectName("dim")
+        row.addWidget(val)
+        row.addWidget(unit_lbl)
+        return val
+
+    # --- Devices: camera, audio input, output display ---
+
+    def _build_devices_card(self) -> Card:
+        card = Card("Devices")
+
         self._cam_combo = QComboBox()
         self._refresh_cameras(initial=True)
         self._cam_combo.currentIndexChanged.connect(self._on_camera_changed)
-        btn_refresh = QPushButton("Refresh")
-        btn_refresh.setToolTip("Rescan for connected cameras")
-        btn_refresh.clicked.connect(self._refresh_cameras)
+        btn_refresh = self._refresh_button("Rescan for connected cameras", self._refresh_cameras)
         self._cam_info_label = QLabel("")
-        self._cam_info_label.setStyleSheet("color: gray; font-size: 10px;")
-        row.addWidget(self._cam_combo)
-        row.addWidget(btn_refresh)
-        row.addWidget(self._cam_info_label)
-        return box
+        self._cam_info_label.setObjectName("dim")
+        self._cam_info_label.setMinimumWidth(120)
+        card.add_row("Camera", self._cam_combo, btn_refresh, self._cam_info_label,
+                     stretch_last=True)
+        card.body.itemAt(card.body.count() - 1).layout().setStretch(1, 1)
+
+        # The checkbox doubles as the row label so the pickers line up.
+        self._audio_enable_cb = QCheckBox("Audio")
+        self._audio_enable_cb.setObjectName("fieldLabel")
+        self._audio_enable_cb.setMinimumWidth(64)
+        self._audio_enable_cb.setChecked(self._state.audio_enabled)
+        self._audio_enable_cb.setToolTip(
+            "Listen on the selected input to recognize enrolled speakers and detect music.\n"
+            "Models download on first use (see People).")
+        self._audio_enable_cb.toggled.connect(self._on_audio_enabled_toggled)
+        self._audio_combo = QComboBox()
+        self._populate_audio_devices_combo()
+        self._audio_combo.currentIndexChanged.connect(self._on_audio_device_changed)
+        btn_arefresh = self._refresh_button("Rescan audio inputs", self._populate_audio_devices_combo)
+        audio_hint = QLabel("speaker + music detection")
+        audio_hint.setObjectName("dim")
+        card.add_row(None, self._audio_enable_cb, self._audio_combo, btn_arefresh, audio_hint,
+                     stretch_last=True)
+        card.body.itemAt(card.body.count() - 1).layout().setStretch(1, 1)
+
+        self._display_combo = QComboBox()
+        screens = QApplication.screens()
+        for i, screen in enumerate(screens):
+            geo = screen.geometry()
+            self._display_combo.addItem(
+                f"Display {i + 1}  ·  {geo.width()}×{geo.height()}", i)
+        if 0 <= self._state.display_index < len(screens):
+            self._display_combo.setCurrentIndex(self._state.display_index)
+        self._display_combo.currentIndexChanged.connect(self._on_display_changed)
+        out_hint = QLabel("fullscreen program output")
+        out_hint.setObjectName("dim")
+        card.add_row("Output", self._display_combo, out_hint, stretch_last=True)
+        card.body.itemAt(card.body.count() - 1).layout().setStretch(1, 1)
+        return card
+
+    @staticmethod
+    def _refresh_button(tip: str, slot) -> QPushButton:
+        btn = QPushButton("⟳")
+        btn.setObjectName("icon")
+        btn.setFixedWidth(32)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(tip)
+        btn.clicked.connect(slot)
+        return btn
 
     def _refresh_cameras(self, initial: bool = False):
         # Never re-probe the camera the video thread is streaming from — opening
@@ -1492,41 +1741,15 @@ class ControlWindow(QMainWindow):
 
     # --- Audio ---
 
-    def _build_audio_section(self):
-        """Audio input controls — Enabled toggle + input device picker.
-
-        The device is remembered by *name* (USB indices shuffle between boots)
-        and audio analysis is re-enabled on launch if it was on last time.
-        """
-        box = QGroupBox("Audio (speaker + music detection)")
-        row = QHBoxLayout(box)
-        self._audio_enable_cb = QCheckBox("Enabled")
-        self._audio_enable_cb.setChecked(self._state.audio_enabled)
-        self._audio_enable_cb.setToolTip(
-            "Listen on the selected input to recognize enrolled speakers and detect music.\n"
-            "Models download on first use (see Manage People).")
-        self._audio_enable_cb.toggled.connect(self._on_audio_enabled_toggled)
-        row.addWidget(self._audio_enable_cb)
-
-        row.addWidget(QLabel("Input:"))
-        self._audio_combo = QComboBox()
-        self._populate_audio_devices_combo()
-        self._audio_combo.currentIndexChanged.connect(self._on_audio_device_changed)
-        row.addWidget(self._audio_combo, stretch=1)
-
-        btn_refresh = QPushButton("Refresh")
-        btn_refresh.setFixedWidth(70)
-        btn_refresh.clicked.connect(self._populate_audio_devices_combo)
-        row.addWidget(btn_refresh)
-        return box
-
     def _populate_audio_devices_combo(self):
+        """Fill the input picker.  The device is remembered by *name* (USB
+        indices shuffle between boots)."""
         self._audio_combo.blockSignals(True)
         self._audio_combo.clear()
-        self._audio_combo.addItem("(System default)", None)
+        self._audio_combo.addItem("System default input", None)
         for dev in list_input_devices():
             self._audio_combo.addItem(
-                f"[{dev['index']}] {dev['name']} ({dev['max_channels']}ch)", dev)
+                f"{dev['name']}  ({dev['max_channels']}ch)", dev)
         # Re-select the remembered device by name
         wanted = self._state.audio_device_name
         if wanted:
@@ -1552,6 +1775,9 @@ class ControlWindow(QMainWindow):
         self._state.set(audio_enabled=on, audio_device_name=name)
         self._persist()
         self._apply_audio_settings(enable=on)
+        if not on:
+            self._audio_status_text = "Audio off"
+            set_pill(self._audio_pill, "AUDIO OFF", DIM)
         if self._people_win is not None:
             self._people_win._refresh_audio_hint()
 
@@ -1561,11 +1787,77 @@ class ControlWindow(QMainWindow):
         self._persist()
         self._audio_thread.set_device(index)
 
-    # --- Shot type ---
+    # --- Follow mode: Disabled / Primary / Time / Manual ---
 
-    def _build_shot_section(self):
-        box = QGroupBox("Shot Type")
-        row = QHBoxLayout(box)
+    def _build_mode_card(self) -> Card:
+        card = Card("Follow mode")
+        triggers = [
+            ("Off",     "disabled", "Show the full camera frame; no tracking."),
+            ("Primary", "primary",  "Follow the closest person; hand off when someone closer or more active appears."),
+            ("Timed",   "time",     "Rotate between tracked people on a fixed interval."),
+            ("Manual",  "manual",   "Only switch when you press a person button below."),
+        ]
+        _valid_triggers = {t[1] for t in triggers}
+        current_trigger = (
+            "disabled" if not self._state.auto_follow_enabled
+            else "primary" if self._state.tracking_mode == 'primary'
+            else self._state.switch_trigger
+                if self._state.switch_trigger in _valid_triggers else "time"
+        )
+        self._trig_seg = Segmented(triggers, current_trigger)
+        self._trig_group = self._trig_seg.group
+        self._trig_group.buttonClicked.connect(self._on_trigger_changed)
+        card.body.addWidget(self._trig_seg)
+
+        self._mode_hint = QLabel("")
+        self._mode_hint.setObjectName("muted")
+        self._mode_hint.setWordWrap(True)
+        card.body.addWidget(self._mode_hint)
+
+        # Interval (time trigger only)
+        self._interval_spin = QDoubleSpinBox()
+        self._interval_spin.setRange(0.5, 60.0)
+        self._interval_spin.setSingleStep(0.5)
+        self._interval_spin.setSuffix(" s")
+        self._interval_spin.setValue(self._state.switch_interval)
+        self._interval_spin.valueChanged.connect(self._on_interval_changed)
+        self._interval_row = QWidget()
+        irow = QHBoxLayout(self._interval_row)
+        irow.setContentsMargins(0, 0, 0, 0)
+        self._interval_label = QLabel("Interval")
+        self._interval_label.setObjectName("fieldLabel")
+        self._interval_label.setMinimumWidth(64)
+        irow.addWidget(self._interval_label)
+        irow.addWidget(self._interval_spin)
+        irow.addStretch()
+        card.body.addWidget(self._interval_row)
+
+        # Manual person buttons (populated dynamically)
+        self._manual_row = QWidget()
+        mrow = QVBoxLayout(self._manual_row)
+        mrow.setContentsMargins(0, 0, 0, 0)
+        mrow.setSpacing(6)
+        self._manual_label = QLabel("Switch to")
+        self._manual_label.setObjectName("fieldLabel")
+        mrow.addWidget(self._manual_label)
+        self._persons_row = QHBoxLayout()
+        self._persons_row.setSpacing(6)
+        self._persons_empty = QLabel("No one tracked yet")
+        self._persons_empty.setObjectName("dim")
+        self._persons_row.addWidget(self._persons_empty)
+        self._persons_row.addStretch()
+        mrow.addLayout(self._persons_row)
+        card.body.addWidget(self._manual_row)
+        self._person_buttons: dict[str, QPushButton] = {}
+
+        self._update_trigger_ui(current_trigger)
+        return card
+
+    # --- Framing: shot type + transition ---
+
+    def _build_framing_card(self) -> Card:
+        card = Card("Framing")
+
         self._shot_combo = QComboBox()
         for label, key in [("Full Body", "full_body"), ("Waist Up", "waist_up"),
                             ("Medium", "medium"), ("Close-Up", "close_up")]:
@@ -1575,150 +1867,65 @@ class ControlWindow(QMainWindow):
                 self._shot_combo.setCurrentIndex(i)
                 break
         self._shot_combo.currentIndexChanged.connect(self._on_shot_changed)
-        row.addWidget(self._shot_combo)
-        return box
+        card.add_row("Shot", self._shot_combo, stretch_last=True)
 
-    # --- Virtual Switcher / Primary Focus settings ---
-
-    def _build_switcher_section(self):
-        self._switcher_box = QGroupBox("Virtual Switcher")
-        layout = QVBoxLayout(self._switcher_box)
-
-        # Trigger row — Primary Focus first, then switcher triggers
-        trig_row = QHBoxLayout()
-        trig_label = QLabel("Mode:")
-        self._trig_group = QButtonGroup()
-        triggers = [
-            ("Disabled", "disabled", "Show the full camera frame; no tracking."),
-            ("Primary",  "primary",  "Follow the closest person; hand off when someone closer or more active appears."),
-            ("Time",     "time",     "Rotate between tracked people on a fixed interval."),
-            ("Manual",   "manual",   "Only switch when you press a person button below."),
-        ]
-        _valid_triggers = {t[1] for t in triggers}
-        current_trigger = (
-            "disabled" if not self._state.auto_follow_enabled
-            else "primary" if self._state.tracking_mode == 'primary'
-            else self._state.switch_trigger
-                if self._state.switch_trigger in _valid_triggers else "time"
-        )
-        for label, key, tip in triggers:
-            rb = QRadioButton(label)
-            rb.setProperty("trigger_key", key)
-            rb.setToolTip(tip)
-            rb.setChecked(key == current_trigger)
-            self._trig_group.addButton(rb)
-            trig_row.addWidget(rb)
-        self._trig_group.buttonClicked.connect(self._on_trigger_changed)
-        trig_row.insertWidget(0, trig_label)
-        layout.addLayout(trig_row)
-
-        # Interval (time trigger only)
-        int_row = QHBoxLayout()
-        self._interval_label = QLabel("Interval (s):")
-        self._interval_spin = QDoubleSpinBox()
-        self._interval_spin.setRange(0.5, 60.0)
-        self._interval_spin.setSingleStep(0.5)
-        self._interval_spin.setValue(self._state.switch_interval)
-        self._interval_spin.valueChanged.connect(self._on_interval_changed)
-        int_row.addWidget(self._interval_label)
-        int_row.addWidget(self._interval_spin)
-        layout.addLayout(int_row)
-
-        # Transition mode
-        sm_row = QHBoxLayout()
-        sm_label = QLabel("Transition:")
-        self._sm_group = QButtonGroup()
-        for label, key in [("Cut", "cut"), ("Crossfade", "crossfade")]:
-            rb = QRadioButton(label)
-            rb.setProperty("sm_key", key)
-            rb.setChecked(key == self._state.switch_mode)
-            self._sm_group.addButton(rb)
-            sm_row.addWidget(rb)
+        self._sm_seg = Segmented(
+            [("Cut", "cut", "Switch instantly."),
+             ("Crossfade", "crossfade", "Blend from the old subject to the new one.")],
+            self._state.switch_mode)
+        self._sm_group = self._sm_seg.group
         self._sm_group.buttonClicked.connect(self._on_switch_mode_changed)
-        sm_row.insertWidget(0, sm_label)
-        layout.addLayout(sm_row)
+        card.add_row("Transition", self._sm_seg, stretch_last=True)
 
-        # Crossfade duration
-        cf_row = QHBoxLayout()
-        self._cf_label = QLabel("Fade (s):")
         self._cf_spin = QDoubleSpinBox()
         self._cf_spin.setRange(0.1, 5.0)
         self._cf_spin.setSingleStep(0.1)
+        self._cf_spin.setSuffix(" s")
         self._cf_spin.setValue(self._state.crossfade_duration)
         self._cf_spin.valueChanged.connect(self._on_crossfade_changed)
-        cf_row.addWidget(self._cf_label)
-        cf_row.addWidget(self._cf_spin)
-        layout.addLayout(cf_row)
+        self._cf_label = QLabel("Fade")
+        self._cf_label.setObjectName("fieldLabel")
+        self._cf_label.setMinimumWidth(64)
+        self._cf_row = QWidget()
+        crow = QHBoxLayout(self._cf_row)
+        crow.setContentsMargins(0, 0, 0, 0)
+        crow.addWidget(self._cf_label)
+        crow.addWidget(self._cf_spin)
+        crow.addStretch()
+        card.body.addWidget(self._cf_row)
+        self._cf_row.setVisible(self._state.switch_mode == 'crossfade')
+        return card
 
-        # Manual person buttons (populated dynamically)
-        self._manual_label = QLabel("Manual Switch:")
-        layout.addWidget(self._manual_label)
-        self._persons_row = QHBoxLayout()
-        layout.addLayout(self._persons_row)
-        self._person_buttons: dict[str, QPushButton] = {}
+    # --- Tracking: exclusion zone + max persons ---
 
-        self._update_trigger_ui(current_trigger)
-        return self._switcher_box
+    def _build_tracking_card(self) -> Card:
+        card = Card("Tracking")
 
-    # --- Output ---
-
-    def _build_output_section(self):
-        box = QGroupBox("Output")
-        layout = QVBoxLayout(box)
-
-        display_row = QHBoxLayout()
-        display_row.addWidget(QLabel("Display:"))
-        self._display_combo = QComboBox()
-        screens = QApplication.screens()
-        for i, screen in enumerate(screens):
-            geo = screen.geometry()
-            self._display_combo.addItem(
-                f"Display {i + 1}  ({geo.width()}×{geo.height()})", i
-            )
-        if 0 <= self._state.display_index < len(screens):
-            self._display_combo.setCurrentIndex(self._state.display_index)
-        self._display_combo.currentIndexChanged.connect(self._on_display_changed)
-        display_row.addWidget(self._display_combo)
-        display_row.addStretch()
-        layout.addLayout(display_row)
-
-        btn_row = QHBoxLayout()
-        self._btn_fullscreen = QPushButton("Open Fullscreen Output")
-        self._btn_fullscreen.setToolTip(
-            "Show the program output fullscreen on the selected display.\n"
-            "Press Esc or double-click the output to close it.")
-        self._btn_fullscreen.clicked.connect(self._toggle_fullscreen)
-        btn_row.addWidget(self._btn_fullscreen)
-        btn_diag = QPushButton("Open Diagnostics")
-        btn_diag.clicked.connect(self._open_diagnostics)
-        btn_row.addWidget(btn_diag)
-        btn_people = QPushButton("Manage People")
-        btn_people.setToolTip("Enroll people by face and voice, and set their priority.")
-        btn_people.clicked.connect(self._open_people)
-        btn_row.addWidget(btn_people)
-        layout.addLayout(btn_row)
-
-        # Foreground exclusion zone slider
-        excl_row = QHBoxLayout()
-        excl_row.addWidget(QLabel("Audience Exclusion:"))
         self._excl_slider = QSlider(Qt.Horizontal)
         self._excl_slider.setRange(0, 100)
         self._excl_slider.setValue(int(round(self._state.foreground_exclusion_y * 100)))
         self._excl_slider.setToolTip(
             "Ignore people whose torso is in the bottom N% of the frame (foreground audience filter).\n"
             "0 = disabled. Increase until stage-front audience members are no longer tracked.\n"
-            "The zone is shown in yellow in the Diagnostics window."
+            "The zone is shown in yellow in Diagnostics."
         )
         self._excl_value_label = QLabel(f"{self._excl_slider.value()}%")
-        self._excl_value_label.setFixedWidth(32)
+        self._excl_value_label.setObjectName("mono")
+        self._excl_value_label.setFixedWidth(36)
+        self._excl_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._excl_slider.valueChanged.connect(self._on_exclusion_changed)
-        excl_row.addWidget(self._excl_slider)
-        excl_row.addWidget(self._excl_value_label)
-        layout.addLayout(excl_row)
+        hdr = QHBoxLayout()
+        lbl = QLabel("Audience exclusion")
+        lbl.setObjectName("fieldLabel")
+        hdr.addWidget(lbl)
+        hdr.addStretch()
+        hdr.addWidget(self._excl_value_label)
+        card.body.addLayout(hdr)
+        card.body.addWidget(self._excl_slider)
+        excl_hint = QLabel("Ignore people in the bottom of the frame")
+        excl_hint.setObjectName("dim")
+        card.body.addWidget(excl_hint)
 
-        # Max tracked persons spinbox
-        mp_row = QHBoxLayout()
-        mp_row.addWidget(QLabel("Max Tracked Persons:"))
         self._max_persons_spin = QSpinBox()
         self._max_persons_spin.setRange(1, 30)
         self._max_persons_spin.setValue(self._state.max_persons)
@@ -1727,17 +1934,15 @@ class ControlWindow(QMainWindow):
             "Higher values let the switcher follow more performers but use more CPU."
         )
         self._max_persons_spin.valueChanged.connect(self._on_max_persons_changed)
-        mp_row.addWidget(self._max_persons_spin)
-        mp_row.addStretch()
-        layout.addLayout(mp_row)
-
-        return box
+        row = card.add_row("Max people", self._max_persons_spin)
+        row.setContentsMargins(0, 6, 0, 0)
+        return card
 
     # --- Status bar ---
 
     def _build_status_bar(self):
         self._status_label = QLabel("Initializing…")
-        self._status_label.setStyleSheet("color: gray; font-size: 11px; padding: 2px;")
+        self._status_label.setObjectName("statusBar")
         return self._status_label
 
     # ------------------------------------------------------------------
@@ -1746,26 +1951,35 @@ class ControlWindow(QMainWindow):
 
     def _on_frame(self, qimg: QImage, meta: dict):
         try:
-            pix = QPixmap.fromImage(qimg)
-            self._preview_label.setPixmap(
-                pix.scaled(self._preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
+            self._preview.set_image(qimg)
             if self._output_win.isVisible():
                 self._output_win.update_frame(qimg)
             # Always feed the diagnostics panel so the log captures events even when hidden.
             self._diag_win.update_diagnostics(meta)
-            self._status_label.setText(
-                f"FPS: {meta['fps']:.1f}  |  "
-                f"Tracking: {meta['n_persons']} person(s)  |  "
-                f"Active: {meta['active_id']}"
-                + ("  |  searching…" if meta.get('searching') else "")
-                + f"  |  {self._audio_status_text}"
-            )
+
+            if not self._last_frame_at:
+                self._live_dot.set_color(GREEN)
+                self._live_label.setText("LIVE")
+            self._last_frame_at = time.monotonic()
+            self._fps_label.setText(f"{meta['fps']:.1f}")
+            self._tracked_label.setText(str(meta['n_persons']))
+            active = meta['active_id']
+            if meta.get('searching'):
+                active = "searching…"
+            elif active in ('none', 'disabled'):
+                active = "—"
+            self._active_label.setText(active)
         finally:
             self._video_thread.frame_consumed()
 
     def _on_camera_info(self, info: str):
         self._cam_info_label.setText(info)
+        if info == "not available":
+            self._live_dot.set_color(RED)
+            self._live_label.setText("NO SIGNAL")
+            self._last_frame_at = 0.0
+            self._preview.set_placeholder("No signal")
+            self._preview.set_image(None)
 
     def _on_status(self, text: str):
         self._last_status = text
@@ -1781,15 +1995,20 @@ class ControlWindow(QMainWindow):
             self._persons_row.removeWidget(btn)
             btn.deleteLater()
 
-        manual_active = self._manual_mode_active()
-        for pid in current - existing:
+        def _track_no(pid: str) -> int:
+            digits = ''.join(ch for ch in pid if ch.isdigit())
+            return int(digits) if digits else 0
+
+        for pid in sorted(current - existing, key=_track_no):
             btn = QPushButton(pid.replace('person', 'P'))
-            btn.setFixedWidth(40)
+            btn.setObjectName("personChip")
+            btn.setCursor(Qt.PointingHandCursor)
             btn.setToolTip(f"Switch to {pid}")
-            btn.setVisible(manual_active)
             btn.clicked.connect(lambda checked, p=pid: self._manual_switch(p))
             self._person_buttons[pid] = btn
-            self._persons_row.addWidget(btn)
+            # Keep the trailing stretch last so chips stay left-aligned.
+            self._persons_row.insertWidget(self._persons_row.count() - 1, btn)
+        self._persons_empty.setVisible(not self._person_buttons)
 
     def _manual_mode_active(self) -> bool:
         return (self._state.auto_follow_enabled
@@ -1807,7 +2026,7 @@ class ControlWindow(QMainWindow):
         self._persist()
 
     def _on_trigger_changed(self, button):
-        key = button.property("trigger_key")
+        key = button.property("key")
         if key == 'disabled':
             self._state.set(auto_follow_enabled=False)
         elif key == 'primary':
@@ -1818,22 +2037,27 @@ class ControlWindow(QMainWindow):
         self._update_trigger_ui(key)
         self._persist()
 
+    _MODE_HINTS = {
+        'disabled': "Full camera frame, no tracking.",
+        'primary':  "Follows the closest person and hands off to whoever gets closer or more active.",
+        'time':     "Rotates between everyone on stage on a fixed interval.",
+        'manual':   "Switches only when you pick someone below.",
+    }
+
     def _update_trigger_ui(self, trigger_key: str):
         """Show/hide controls based on selected trigger."""
-        show_interval = trigger_key == 'time'
-        self._interval_label.setVisible(show_interval)
-        self._interval_spin.setVisible(show_interval)
-        manual_active = trigger_key == 'manual'
-        self._manual_label.setVisible(manual_active)
-        for btn in self._person_buttons.values():
-            btn.setVisible(manual_active)
+        self._mode_hint.setText(self._MODE_HINTS.get(trigger_key, ""))
+        self._interval_row.setVisible(trigger_key == 'time')
+        self._manual_row.setVisible(trigger_key == 'manual')
 
     def _on_interval_changed(self, val: float):
         self._state.set(switch_interval=val)
         self._persist()
 
     def _on_switch_mode_changed(self, button):
-        self._state.set(switch_mode=button.property("sm_key"))
+        key = button.property("key")
+        self._state.set(switch_mode=key)
+        self._cf_row.setVisible(key == 'crossfade')
         self._persist()
 
     def _on_crossfade_changed(self, val: float):
@@ -1851,8 +2075,9 @@ class ControlWindow(QMainWindow):
         self._state.set(diag_visible=bool(visible))
 
     def _on_output_visibility(self, visible: bool):
-        self._btn_fullscreen.setText(
-            "Close Fullscreen Output" if visible else "Open Fullscreen Output")
+        self._btn_fullscreen.setText("Exit Fullscreen" if visible else "Go Fullscreen")
+        self._btn_fullscreen.setCheckable(True)
+        self._btn_fullscreen.setChecked(visible)
 
     def _on_exclusion_changed(self, value: int):
         self._excl_value_label.setText(f"{value}%")
@@ -1905,10 +2130,13 @@ class ControlWindow(QMainWindow):
         enabled_now = self._audio_thread.is_capturing
         self._state.set(music_mode=music_mode, audio_music_score=music_score,
                         audio_speech_score=speech_score)
-        mode_text = "MUSIC" if music_mode else "Speech"
-        self._audio_status_text = (
-            f"Audio: {mode_text} (m={music_score:.2f} s={speech_score:.2f})"
-            if enabled_now else "Audio: off")
+        if enabled_now:
+            if music_mode:
+                set_pill(self._audio_pill, f"MUSIC  {music_score:.2f}", PURPLE)
+            else:
+                set_pill(self._audio_pill, f"SPEECH  {speech_score:.2f}", GREEN)
+        else:
+            set_pill(self._audio_pill, "AUDIO OFF", DIM)
         # Reflect the real capture state (a device error turns it off).
         if self._audio_enable_cb.isChecked() != enabled_now:
             self._audio_enable_cb.blockSignals(True)
@@ -1923,10 +2151,10 @@ class ControlWindow(QMainWindow):
             audio_speaker_score=float(score),
             audio_speaker_expires_at=time.monotonic() + SPEAKER_BOOST_HOLD_S,
         )
-        self._audio_status_text = f"Audio: ● {name} ({score:.2f})"
+        set_pill(self._audio_pill, f"● {name}  {score:.2f}", ACCENT)
 
     def _on_audio_error(self, msg: str):
-        self._audio_status_text = f"Audio error: {msg}"
+        set_pill(self._audio_pill, "AUDIO ERROR", RED)
         self._on_status(f"Audio error: {msg}")
 
     def _open_people(self):

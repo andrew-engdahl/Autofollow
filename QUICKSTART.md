@@ -20,16 +20,16 @@ The control panel appears right away; wait for the status bar to change from *Lo
 
 ## Running a show
 
-1. **Camera** — pick the input. The label next to it shows the resolution/fps it opened at.
-2. **Display** — choose the projector/monitor, then **Open Fullscreen Output**. Esc, Q or double-click on the output closes it.
-3. **Mode**
+1. **Devices → Camera** — pick the input. The label next to it shows the resolution/fps it opened at.
+2. **Devices → Output** — choose the projector/monitor, then **Go Fullscreen**. Esc, Q or double-click on the output closes it.
+3. **Follow mode**
    - **Primary** — follows the closest person and hands off automatically. Good default for a single presenter or a panel.
-   - **Time** — rotates between everyone on stage every *Interval* seconds.
+   - **Timed** — rotates between everyone on stage every *Interval* seconds.
    - **Manual** — press **P1 / P2 / …** to pick who's on screen.
-   - **Disabled** — full wide shot, no tracking.
-4. **Shot Type** and **Transition** can be changed live.
-5. If people in the front row keep getting picked up, raise **Audience Exclusion** until they fall inside the yellow zone in **Diagnostics**.
-6. *(Optional, needs `--with-recognition`)* **Manage People** to enroll the pastor / worship leader by photo and voice with a priority; tick **Audio → Enabled** to use speaker recognition and music detection live.
+   - **Off** — full wide shot, no tracking.
+4. **Framing** (shot and transition) can be changed live.
+5. If people in the front row keep getting picked up, raise **Audience exclusion** until they fall inside the yellow zone in **Diagnostics**.
+6. *(Optional, needs `--with-recognition`)* **People** to enroll the pastor / worship leader by photo and voice with a priority; tick **Devices → Audio** to use speaker recognition and music detection live.
 
 Everything you set is remembered for next time.
 

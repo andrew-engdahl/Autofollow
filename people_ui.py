@@ -122,7 +122,6 @@ class EditProfileDialog(QDialog):
         form_box = QGroupBox("Profile")
         form = QFormLayout(form_box)
         self._name_edit = QLineEdit(profile.name if profile else "")
-        self._name_edit.setPlaceholderText("e.g. Pastor Mike")
         form.addRow("Name:", self._name_edit)
 
         prio_row = QHBoxLayout()

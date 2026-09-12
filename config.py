@@ -39,8 +39,10 @@ SHOT_TYPE_ZOOM = {
 # PTZ smoothing
 # SMOOTHING: 0 = minimal extra smoothing (still has significant baseline),
 #            1 = very smooth / noticeably delayed movement.
-# Panning (X) is the primary motion axis; tilt (Y) and zoom (Z) are secondary
-# and are smoothed much more aggressively to keep them nearly static.
+# The smoother works on the crop center + zoom, so zooms stay anchored on the
+# subject.  Panning (X) is the primary motion axis; tilt (Y) and zoom (Z) are
+# secondary, with their own deadzones, and are smoothed much more aggressively
+# to keep them nearly static.
 SMOOTHING = 0.5                   # 0–1 user-facing smoothing dial
 MAX_PAN_SPEED = 15                # Maximum pan movement in source pixels per frame
 MAX_TILT_SPEED = 3                # Maximum tilt movement in source pixels per frame (slow)
