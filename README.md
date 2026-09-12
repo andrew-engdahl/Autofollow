@@ -132,6 +132,8 @@ TRACK_DROPOUT_SECONDS = 2.0
 - Lower `DETECTION_SCALE` or raise `DETECTION_INTERVAL` for more headroom on slower machines; raise `DETECTION_SCALE` toward 1.0 if small, distant people are missed.
 - Output frames are dropped rather than queued if the UI falls behind, so latency stays bounded.
 - Face recognition and audio analysis run on their own threads and never block the video pipeline; one shared InsightFace / SpeechBrain instance serves both live recognition and profile enrollment.
+- InsightFace runs on CoreML (Neural Engine) when available — ~25 ms per pass vs ~230 ms on CPU — falling back to a thread-capped CPU session. `AUTOFOLLOW_FACE_PROVIDERS=CPUExecutionProvider` forces CPU.
+- First-time model loads (YAMNet/TensorFlow in particular) briefly reduce the frame rate while they import; this happens once per session, after the camera is already running.
 
 ## Troubleshooting
 

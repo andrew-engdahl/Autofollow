@@ -65,7 +65,10 @@ class SpeakerRecognizer:
     def _load_model(self):
         # speechbrain.inference uses Hugging Face Hub on first call to fetch
         # the model into a savedir; subsequent calls load from disk.
+        import logging
         import torch
+        # SpeechBrain logs every file fetch at INFO; keep the console for our own status.
+        logging.getLogger("speechbrain").setLevel(logging.WARNING)
         from speechbrain.inference.speaker import EncoderClassifier
 
         savedir = Path.home() / ".autofollow" / "models" / "ecapa-voxceleb"

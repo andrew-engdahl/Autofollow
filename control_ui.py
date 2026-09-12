@@ -253,6 +253,7 @@ class VideoThread(QThread):
     diag_frame_ready = pyqtSignal(QImage)    # raw input frame with color-coded overlays
     camera_info = pyqtSignal(str)             # e.g. "1920x1080 @ 30fps"
     status = pyqtSignal(str)                  # human-readable pipeline state / errors
+    model_ready = pyqtSignal()                # pose model loaded; pipeline about to start
     persons_updated = pyqtSignal(list)        # list of person IDs currently tracked
 
     def __init__(self, state: AppState, profile_store: ProfileStore | None = None,
@@ -323,6 +324,7 @@ class VideoThread(QThread):
             self.status.emit(f"Could not load pose model: {e}")
             return
         self.status.emit(f"Model ready on {self._detector.device}")
+        self.model_ready.emit()
 
         settings = self._state.read()
         self._open_camera(settings['camera_index'])
@@ -1423,8 +1425,12 @@ class ControlWindow(QMainWindow):
         self._build_ui()
         self._video_thread.start()
         self._audio_thread.start()
+        # If audio analysis was on last time, bring it back only once the pose
+        # model is loaded: importing TensorFlow / loading YAMNet at the same
+        # time starves the video thread and delays the first frame by seconds.
         if self._state.audio_enabled:
-            self._apply_audio_settings(enable=True)
+            self._video_thread.model_ready.connect(
+                lambda: self._apply_audio_settings(enable=self._state.audio_enabled))
 
     # ------------------------------------------------------------------
     # UI construction

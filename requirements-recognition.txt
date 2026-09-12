@@ -3,7 +3,7 @@
 # These are large (TensorFlow alone is ~500 MB) and some build native
 # extensions; the core app runs fully without them, with the People /
 # Audio features reporting "unavailable".
-insightface>=0.7.3
+insightface>=2.0        # 2.0+ for stable CoreML sessions (10× faster than CPU on Apple Silicon)
 onnxruntime>=1.17.0
 webrtcvad-wheels>=2.0.10
 speechbrain>=0.5.16
