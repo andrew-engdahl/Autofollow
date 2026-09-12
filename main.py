@@ -17,13 +17,8 @@ import sys
 
 
 def list_cameras():
-    import cv2
-    cameras = []
-    for i in range(8):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            cameras.append(i)
-            cap.release()
+    from camera import scan_cameras
+    cameras = scan_cameras()
     if cameras:
         print(f"Available cameras: {cameras}")
     else:
@@ -34,7 +29,6 @@ def run_gui():
     from PyQt5.QtWidgets import QApplication, QSplashScreen
     from PyQt5.QtGui import QPixmap, QPainter, QColor, QFont, QPen, QBrush, QLinearGradient
     from PyQt5.QtCore import Qt, QTimer, QRectF, QPointF
-    from control_ui import ControlWindow
 
     app = QApplication(sys.argv)
     app.setApplicationName("Autofollow")
@@ -110,14 +104,19 @@ def run_gui():
     splash.show()
     app.processEvents()
 
+    # Imported only now so the splash is on screen before Qt widgets / OpenCV
+    # load.  The pose model itself is loaded on the video thread, so the
+    # control panel appears right away with a "Loading pose model…" status.
+    from control_ui import ControlWindow
     window = ControlWindow()
 
-    # Close splash and show main window after 1.8 s
     def _finish():
         splash.finish(window)
         window.show()
+        window.raise_()
+        window.activateWindow()
 
-    QTimer.singleShot(1800, _finish)
+    QTimer.singleShot(1200, _finish)
     sys.exit(app.exec_())
 
 

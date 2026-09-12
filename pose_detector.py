@@ -4,12 +4,8 @@ import cv2
 import numpy as np
 from config import CONFIDENCE_THRESHOLD, YOLO_MODEL, DETECTION_SCALE
 
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
-    print("Warning: YOLOv8 not available. Install with: pip install ultralytics")
+# COCO keypoint indices for the hips
+_HIP_INDICES = (11, 12)
 
 
 def _best_device():
@@ -29,18 +25,33 @@ class PoseDetector:
     """Detects human poses in video frames using YOLOv8 Pose.
 
     Returns all detected persons as a list of dicts, not just the first.
+
+    torch/ultralytics are imported here rather than at module level so the
+    GUI can come up immediately and load the model on the video thread.
     """
 
     def __init__(self):
-        if not YOLO_AVAILABLE:
-            raise ImportError("YOLOv8 is required. Install with: pip install ultralytics")
+        try:
+            from ultralytics import YOLO
+        except ImportError as e:
+            raise ImportError(
+                "YOLOv8 is required. Install with: pip install ultralytics"
+            ) from e
 
         print(f"Loading {YOLO_MODEL}...")
         self.model = YOLO(YOLO_MODEL)
-        device = _best_device()
-        self.model.to(device)
-        print(f"Using device: {device}")
+        self.device = _best_device()
+        self.model.to(self.device)
+        print(f"Using device: {self.device}")
         self.conf_threshold = CONFIDENCE_THRESHOLD
+
+    def warmup(self, width: int = 640, height: int = 360):
+        """Run one throwaway inference so the first real frame isn't slow."""
+        try:
+            self.model(np.zeros((height, width, 3), dtype=np.uint8),
+                       conf=self.conf_threshold, verbose=False)
+        except Exception:
+            pass
 
     def detect(self, frame):
         """Detect all persons in a frame.
@@ -74,63 +85,55 @@ class PoseDetector:
         if not results or results[0].keypoints is None:
             return persons
 
-        kpts_data = results[0].keypoints.data    # shape: (N, 17, 3) — x, y, conf in det_frame coords
-        boxes_data = results[0].boxes             # detection boxes
+        # Pull everything off the GPU in one transfer.  Per-element .item()
+        # calls each force a device sync, which on MPS costs more than the
+        # inference itself once a few people are in frame.
+        kpts_all = results[0].keypoints.data.cpu().numpy()   # (N, 17, 3) — x, y, conf in det_frame coords
+        boxes = results[0].boxes
+        box_conf = boxes.conf.cpu().numpy() if boxes is not None and len(boxes) else None
 
-        scale_x = w / det_w
-        scale_y = h / det_h
+        if kpts_all.size == 0:
+            return persons
 
-        for i, kpts in enumerate(kpts_data):
-            # Build keypoints array normalized to original frame
-            landmarks = []
-            x_coords, y_coords = [], []
+        scale = np.array([w / det_w, h / det_h], dtype=np.float32)
 
-            for kpt in kpts:
-                kx, ky, kconf = kpt[0].item(), kpt[1].item(), kpt[2].item()
-                # Scale back to original frame coords
-                px, py = kx * scale_x, ky * scale_y
-                landmarks.append([px / w, py / h, 0.0, kconf])
-                if kconf > self.conf_threshold:
-                    x_coords.append(px)
-                    y_coords.append(py)
-
-            if not x_coords:
+        for i, kpts in enumerate(kpts_all):
+            px = kpts[:, :2] * scale                     # (17, 2) pixel coords in original frame
+            conf = kpts[:, 2]
+            visible = conf > self.conf_threshold
+            if not visible.any():
                 continue
+
+            vis_px = px[visible]
+            x_min, y_min = vis_px.min(axis=0)
+            x_max, y_max = vis_px.max(axis=0)
 
             # Reject poses where any visible keypoint lies outside the input frame.
             # This filters people whose body extends beyond the camera's field of view —
             # their partially-clipped poses would produce unreliable framing targets.
-            if (min(x_coords) < 0 or min(y_coords) < 0
-                    or max(x_coords) > w or max(y_coords) > h):
+            if x_min < 0 or y_min < 0 or x_max > w or y_max > h:
                 continue
 
-            # Require at least one hip keypoint (COCO indices 11=left_hip, 12=right_hip).
-            # This filters foreground audience members whose body is cut off at the waist —
-            # they appear as large, high-confidence face detections with no lower body.
-            _HIP_INDICES = [11, 12]
-            has_hips = any(
-                landmarks[idx][3] > self.conf_threshold
-                for idx in _HIP_INDICES
-                if idx < len(landmarks)
-            )
-            if not has_hips:
+            # Require at least one hip keypoint.  This filters foreground audience
+            # members whose body is cut off at the waist — they appear as large,
+            # high-confidence face detections with no lower body.
+            if not any(visible[idx] for idx in _HIP_INDICES if idx < len(visible)):
                 continue
 
-            x_min = int(min(x_coords))
-            y_min = int(min(y_coords))
-            x_max = int(max(x_coords))
-            y_max = int(max(y_coords))
+            landmarks = np.zeros((len(kpts), 4), dtype=np.float32)
+            landmarks[:, 0] = px[:, 0] / w
+            landmarks[:, 1] = px[:, 1] / h
+            landmarks[:, 3] = conf
 
-            # Person confidence: use box confidence when available, else mean keypoint conf
-            if boxes_data is not None and i < len(boxes_data):
-                conf = float(boxes_data.conf[i])
+            if box_conf is not None and i < len(box_conf):
+                person_conf = float(box_conf[i])
             else:
-                conf = float(np.mean([lm[3] for lm in landmarks]))
+                person_conf = float(conf.mean())
 
             persons.append({
-                'bbox': (x_min, y_min, x_max, y_max),
-                'keypoints': np.array(landmarks, dtype=np.float32),
-                'confidence': conf,
+                'bbox': (int(x_min), int(y_min), int(x_max), int(y_max)),
+                'keypoints': landmarks,
+                'confidence': person_conf,
             })
 
         return persons

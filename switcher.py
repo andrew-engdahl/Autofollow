@@ -86,9 +86,16 @@ class VirtualSwitcher:
         now = time.monotonic()
         ids = [p.id for p in persons]
 
-        # Initialise active_id on first call
+        # Initialise active_id on first call, or re-adopt if the active person vanished.
         if self.active_id is None or self.active_id not in ids:
-            self.active_id = persons[0].id
+            # Prefer the person we were already heading toward, if still present.
+            if self._pending_id in ids:
+                self.active_id = self._pending_id
+            else:
+                self.active_id = persons[0].id
+            self._pending_id = None
+            self._pretraveling = False
+            self._fade_start = None
             self._last_switch_time = now
             return self.active_id
 

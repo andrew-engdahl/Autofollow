@@ -1,10 +1,11 @@
 """Multi-person tracker with stable IDs, foreground scoring, and activity scoring."""
 
+import time
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+import config
 from config import MAX_PERSONS, FOREGROUND_EXCLUSION_Y as _DEFAULT_EXCLUSION_Y
 
-_DROPOUT_FRAMES = 60    # drop a track after this many consecutive unmatched frames (~2s at 30fps)
 _IOU_THRESHOLD = 0.10   # minimum IoU to match; lowered to tolerate fast movement
 _BBOX_ALPHA = 0.5       # bbox smoothing: higher = follows detection more closely (less lag)
 _ACTIVITY_EMA_ALPHA = 0.3   # EMA smoothing for activity score — damps single-frame spikes
@@ -15,8 +16,8 @@ _ACTIVITY_DY_WEIGHT = 1.0   # vertical displacement weight
 # match when the detection center is within this fraction of the frame's diagonal.
 _CENTER_DIST_FALLBACK = 0.25   # fraction of frame diagonal — generous to handle fast movers
 
-
 _FG_SCORE_EMA_ALPHA = 0.15   # heavy smoothing on bbox-area score to prevent fg_ratio oscillation
+
 
 @dataclass
 class TrackedPerson:
@@ -26,7 +27,8 @@ class TrackedPerson:
     confidence: float
     foreground_score: float = 0.0    # EMA-smoothed bbox_area / frame_area — larger = closer
     activity_score: float = 0.0      # EMA-smoothed weighted center displacement
-    frames_unseen: int = 0
+    frames_unseen: int = 0           # consecutive detector passes without a match
+    last_seen: float = 0.0           # time.monotonic() of the last matched detection
 
 
 def _iou(a, b):
@@ -79,7 +81,12 @@ def _area(bbox):
 
 
 class PersonTracker:
-    """Maintains stable person identities across frames using greedy IoU matching."""
+    """Maintains stable person identities across frames using greedy IoU matching.
+
+    Call update() once per *detector pass* (not per video frame): tracks expire
+    on wall-clock time, so skipping detection on some frames doesn't shorten
+    how long a briefly-occluded person is remembered.
+    """
 
     def __init__(self):
         self._tracks: dict[str, TrackedPerson] = {}   # id → TrackedPerson
@@ -99,6 +106,7 @@ class PersonTracker:
             List of TrackedPerson sorted by foreground_score descending (primary first).
         """
         fh, fw = frame_shape[:2]
+        now = time.monotonic()
         self._frame_area = max(1.0, float(fw * fh))
 
         # Drop detections whose torso center falls in the foreground exclusion zone.
@@ -112,85 +120,10 @@ class PersonTracker:
                 if _torso_center(d['keypoints'], fw, fh, d['bbox'])[1] <= exclusion_threshold
             ]
 
-        # Increment unseen counter for all existing tracks
         for t in self._tracks.values():
             t.frames_unseen += 1
 
-        # Matching: build a full IoU matrix, then greedily assign best pairs
-        # (highest IoU first) to reduce the "greedy order" artifacts where a
-        # low-confidence pair steals a track from a better match further down.
-        frame_diag = (fh ** 2 + fw ** 2) ** 0.5
-        max_center_dist = frame_diag * _CENTER_DIST_FALLBACK
-
-        existing_ids = list(self._tracks.keys())
-        matched_ids = set()
-        matched_det_indices = set()
-
-        # Phase 1: IoU matching — collect all (iou, det_idx, track_id) pairs,
-        # sort descending by IoU, then greedily assign best-first.
-        iou_pairs = []
-        for det_idx, det in enumerate(detections):
-            for tid in existing_ids:
-                score = _iou(det['bbox'], self._tracks[tid].bbox)
-                if score >= _IOU_THRESHOLD:
-                    iou_pairs.append((score, det_idx, tid))
-        iou_pairs.sort(reverse=True)
-
-        for score, det_idx, tid in iou_pairs:
-            if det_idx in matched_det_indices or tid in matched_ids:
-                continue
-            matched_ids.add(tid)
-            matched_det_indices.add(det_idx)
-
-        # Phase 2: center-distance fallback for unmatched detections
-        for det_idx, det in enumerate(detections):
-            if det_idx in matched_det_indices:
-                continue
-            best_id = None
-            best_dist = max_center_dist
-            dcx, dcy = _center(det['bbox'])
-            for tid in existing_ids:
-                if tid in matched_ids:
-                    continue
-                tcx, tcy = _center(self._tracks[tid].bbox)
-                dist = ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5
-                if dist < best_dist:
-                    best_dist, best_id = dist, tid
-            if best_id is not None:
-                matched_ids.add(best_id)
-                matched_det_indices.add(det_idx)
-
-        # Phase 3: apply updates for all matched pairs
-        # Re-derive the (det_idx → track_id) mapping from the two match phases.
-        # Rebuild by re-scanning (cheap — small N).
-        det_to_track: dict[int, str] = {}
-        # IoU matches
-        seen_d: set[int] = set()
-        seen_t: set[str] = set()
-        for score, det_idx, tid in iou_pairs:
-            if det_idx not in seen_d and tid not in seen_t:
-                det_to_track[det_idx] = tid
-                seen_d.add(det_idx)
-                seen_t.add(tid)
-        # Center-distance matches (re-run to get the actual assignments)
-        for det_idx, det in enumerate(detections):
-            if det_idx in det_to_track:
-                continue
-            best_id = None
-            best_dist = max_center_dist
-            dcx, dcy = _center(det['bbox'])
-            for tid in existing_ids:
-                if tid in seen_t:
-                    continue
-                tcx, tcy = _center(self._tracks[tid].bbox)
-                dist = ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5
-                if dist < best_dist:
-                    best_dist, best_id = dist, tid
-            if best_id is not None:
-                det_to_track[det_idx] = best_id
-                seen_t.add(best_id)
-
-        matched_det_indices = set(det_to_track.keys())
+        det_to_track = self._match(detections, fw, fh)
 
         for det_idx, tid in det_to_track.items():
             det = detections[det_idx]
@@ -214,11 +147,12 @@ class PersonTracker:
                                       + (1.0 - _FG_SCORE_EMA_ALPHA) * track.foreground_score)
             track.activity_score = activity
             track.frames_unseen = 0
+            track.last_seen = now
 
         # Create new tracks for unmatched detections (up to max_persons limit)
         limit = max_persons if max_persons is not None else MAX_PERSONS
         for det_idx, det in enumerate(detections):
-            if det_idx in matched_det_indices:
+            if det_idx in det_to_track:
                 continue
             if len(self._tracks) >= limit:
                 break
@@ -232,16 +166,62 @@ class PersonTracker:
                 foreground_score=_area(det['bbox']) / self._frame_area,
                 activity_score=0.0,
                 frames_unseen=0,
+                last_seen=now,
             )
 
         # Drop tracks that haven't been seen recently
         to_drop = [tid for tid, t in self._tracks.items()
-                   if t.frames_unseen > _DROPOUT_FRAMES]
+                   if now - t.last_seen > config.TRACK_DROPOUT_SECONDS]
         for tid in to_drop:
             del self._tracks[tid]
 
-        return sorted(self._tracks.values(),
-                      key=lambda t: t.foreground_score, reverse=True)
+        return self.get_all()
+
+    def _match(self, detections: list[dict], fw: int, fh: int) -> dict[int, str]:
+        """Return {detection index → track id} for all matched pairs.
+
+        Phase 1 collects every (IoU, det, track) pair above threshold and assigns
+        greedily best-first, so a weak pair can't steal a track from a better
+        match further down the list.  Phase 2 gives the leftovers a
+        center-distance fallback to survive fast movement between detector passes.
+        """
+        det_to_track: dict[int, str] = {}
+        used_tracks: set[str] = set()
+        existing_ids = list(self._tracks.keys())
+
+        iou_pairs = []
+        for det_idx, det in enumerate(detections):
+            for tid in existing_ids:
+                score = _iou(det['bbox'], self._tracks[tid].bbox)
+                if score >= _IOU_THRESHOLD:
+                    iou_pairs.append((score, det_idx, tid))
+        iou_pairs.sort(reverse=True)
+
+        for _, det_idx, tid in iou_pairs:
+            if det_idx in det_to_track or tid in used_tracks:
+                continue
+            det_to_track[det_idx] = tid
+            used_tracks.add(tid)
+
+        max_center_dist = (fh ** 2 + fw ** 2) ** 0.5 * _CENTER_DIST_FALLBACK
+        for det_idx, det in enumerate(detections):
+            if det_idx in det_to_track:
+                continue
+            best_id = None
+            best_dist = max_center_dist
+            dcx, dcy = _center(det['bbox'])
+            for tid in existing_ids:
+                if tid in used_tracks:
+                    continue
+                tcx, tcy = _center(self._tracks[tid].bbox)
+                dist = ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist, best_id = dist, tid
+            if best_id is not None:
+                det_to_track[det_idx] = best_id
+                used_tracks.add(best_id)
+
+        return det_to_track
 
     def get_primary(self) -> TrackedPerson | None:
         """Return the most-foreground (largest bbox) tracked person."""

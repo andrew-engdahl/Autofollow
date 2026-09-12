@@ -9,7 +9,7 @@ from pose_detector import PoseDetector
 from tracker import PersonTracker
 from framing_engine import FramingEngine
 from smoothing import PTZSmoother
-import config
+from camera import open_capture, describe_capture
 
 
 class VideoProcessor:
@@ -39,13 +39,11 @@ class VideoProcessor:
 
     def initialize_camera(self):
         """Open camera and prepare output writer."""
-        self._cap = cv2.VideoCapture(self.camera_index)
-        if not self._cap.isOpened():
+        self._cap = open_capture(self.camera_index)
+        if self._cap is None:
             raise RuntimeError(f"Failed to open camera device {self.camera_index}")
 
-        w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = self._cap.get(cv2.CAP_PROP_FPS) or 30
+        w, h, fps = describe_capture(self._cap)
 
         self.input_width = w
         self.input_height = h
@@ -65,18 +63,15 @@ class VideoProcessor:
 
         Returns a dict with 'frame' (cropped output), 'persons', 'active_id'.
         """
+        # Detection only runs every DETECTION_INTERVAL frames; in between, keep
+        # following the last known track positions (tracks expire on wall time).
         if self._frame_count % DETECTION_INTERVAL == 0:
             detections = self._detector.detect(frame)
+            persons = self._tracker.update(detections, frame.shape)
         else:
-            detections = []
+            persons = self._tracker.get_all()
 
-        persons = self._tracker.update(detections, frame.shape)
-
-        mode = config.TRACKING_MODE
-        if mode == 'primary' or not persons:
-            output_frame, active_id = self._render_primary(frame, persons)
-        else:
-            output_frame, active_id = self._render_primary(frame, persons)
+        output_frame, active_id = self._render_primary(frame, persons)
 
         if self.show_overlay:
             n = len(persons)
@@ -89,7 +84,7 @@ class VideoProcessor:
 
     def _render_primary(self, frame, persons):
         if not persons:
-            tx, ty, tz = self._framing._default_target()
+            tx, ty, tz = self._framing.default_target()
             sx, sy, sz = self._smoother.update('primary', tx, ty, tz)
         else:
             primary = persons[0]

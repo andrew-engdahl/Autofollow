@@ -1,8 +1,8 @@
 """PyQt5 control panel with integrated video thread and fullscreen output window."""
 
-import sys
 import time
 import threading
+from collections import deque
 import cv2
 import numpy as np
 
@@ -12,15 +12,15 @@ from PyQt5.QtWidgets import (
     QGroupBox, QDoubleSpinBox, QSpinBox, QSlider, QCheckBox,
     QTableWidget, QTableWidgetItem, QTextEdit, QHeaderView,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker, QSettings
 from PyQt5.QtGui import QImage, QPixmap, QFont, QColor
 
 import config
-from pose_detector import PoseDetector
+from camera import scan_cameras, open_capture, describe_capture
 from tracker import PersonTracker
 from framing_engine import FramingEngine
 from smoothing import PTZSmoother
-from switcher import VirtualSwitcher
+from switcher import VirtualSwitcher, _PRETRAVEL_DURATION
 
 
 # ---------------------------------------------------------------------------
@@ -40,8 +40,22 @@ _SKELETON = [
     (12, 14), (14, 16),       # right leg
 ]
 
+# The diagnostics preview is small, so annotate a downscaled copy of the
+# camera frame rather than a full 1080p/4K copy every frame.
+_DIAG_MAX_WIDTH = 960
+
+# How fast to zoom out each frame while searching for a lost subject
+# (zoom units/frame).  At 30fps this goes from zoom 3 to the full frame in ~3s.
+_SEARCH_ZOOM_OUT_RATE = 0.008
+
+# Camera watchdog: if no frame arrives for this long, try to re-open the device.
+_CAMERA_STALL_SECONDS = 3.0
+
+# Maximum output frames handed to the UI thread but not yet painted.  Anything
+# beyond this is dropped so a slow UI can't build up a growing latency queue.
+_MAX_FRAMES_IN_FLIGHT = 2
+
 # Per-person colors: evenly-spaced hues around the HSV wheel (BGR).
-# Up to 12 persons (matching MAX_PERSONS); cycles if more.
 def _person_color(index: int) -> tuple[int, int, int]:
     """Return a vivid BGR color for person at position `index` (0-based)."""
     hue = int((index * 137.5) % 180)   # golden-angle step keeps neighbours distinct
@@ -49,24 +63,26 @@ def _person_color(index: int) -> tuple[int, int, int]:
     bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]
     return (int(bgr[0]), int(bgr[1]), int(bgr[2]))
 
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _scan_cameras(max_cams: int = 8) -> list[int]:
-    available = []
-    for i in range(max_cams):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            available.append(i)
-            cap.release()
-    return available
+_HAS_BGR888 = hasattr(QImage, 'Format_BGR888')
 
 
 def _bgr_to_qimage(frame: np.ndarray) -> QImage:
     h, w, ch = frame.shape
+    if _HAS_BGR888:
+        # Qt swaps channels while copying — saves a separate cvtColor pass.
+        frame = np.ascontiguousarray(frame)
+        return QImage(frame.data, w, h, ch * w, QImage.Format_BGR888).copy()
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+
+
+def _bbox_center_x(person) -> float:
+    return (person.bbox[0] + person.bbox[2]) / 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +90,14 @@ def _bgr_to_qimage(frame: np.ndarray) -> QImage:
 # ---------------------------------------------------------------------------
 
 class AppState:
+    # Fields persisted between launches (QSettings key → attribute).
+    _PERSISTED = (
+        'camera_index', 'tracking_mode', 'shot_type', 'switch_mode',
+        'switch_trigger', 'switch_interval', 'crossfade_duration',
+        'auto_follow_enabled', 'foreground_exclusion_y', 'max_persons',
+        'diag_overlays', 'display_index',
+    )
+
     def __init__(self):
         self._lock = QMutex()
         self.camera_index: int = config.CAMERA_INDEX
@@ -85,10 +109,12 @@ class AppState:
         self.crossfade_duration: float = config.CROSSFADE_DURATION
         self.manual_switch_id: str | None = None         # set by UI, consumed by video thread
         self.camera_change_requested: bool = False
-        self.show_diagnostics: bool = config.SHOW_DIAGNOSTICS
         self.auto_follow_enabled: bool = True
         self.foreground_exclusion_y: float = config.FOREGROUND_EXCLUSION_Y
         self.max_persons: int = config.MAX_PERSONS
+        self.diag_visible: bool = False                  # diagnostics window is on screen
+        self.diag_overlays: bool = config.SHOW_DIAGNOSTICS
+        self.display_index: int = 0
 
     def read(self):
         """Return a snapshot of current settings (thread-safe)."""
@@ -101,13 +127,18 @@ class AppState:
                 'switch_trigger': self.switch_trigger,
                 'switch_interval': self.switch_interval,
                 'crossfade_duration': self.crossfade_duration,
-                'manual_switch_id': self.manual_switch_id,
-                'camera_change_requested': self.camera_change_requested,
-                'show_diagnostics': self.show_diagnostics,
                 'auto_follow_enabled': self.auto_follow_enabled,
                 'foreground_exclusion_y': self.foreground_exclusion_y,
                 'max_persons': self.max_persons,
+                'diag_visible': self.diag_visible,
+                'diag_overlays': self.diag_overlays,
             }
+
+    def set(self, **kwargs):
+        """Thread-safe attribute update from the UI thread."""
+        with QMutexLocker(self._lock):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
 
     def consume_manual_switch(self) -> str | None:
         with QMutexLocker(self._lock):
@@ -121,6 +152,45 @@ class AppState:
             self.camera_change_requested = False
             return val
 
+    # --- persistence -------------------------------------------------------
+
+    def load(self, settings: QSettings):
+        """Restore persisted fields, keeping each attribute's current type."""
+        for key in self._PERSISTED:
+            if not settings.contains(key):
+                continue
+            current = getattr(self, key)
+            try:
+                if isinstance(current, bool):
+                    val = settings.value(key, current, type=bool)
+                elif isinstance(current, int):
+                    val = settings.value(key, current, type=int)
+                elif isinstance(current, float):
+                    val = settings.value(key, current, type=float)
+                else:
+                    val = settings.value(key, current, type=str)
+            except (TypeError, ValueError):
+                continue
+            setattr(self, key, val)
+        # Sanity-clamp anything a stale settings file could have corrupted
+        if self.shot_type not in ('full_body', 'waist_up', 'medium', 'close_up'):
+            self.shot_type = config.SHOT_TYPE
+        if self.tracking_mode not in ('primary', 'switcher'):
+            self.tracking_mode = config.TRACKING_MODE
+        if self.switch_mode not in ('cut', 'crossfade'):
+            self.switch_mode = config.SWITCH_MODE
+        if self.switch_trigger not in ('time', 'manual'):
+            self.switch_trigger = 'time'
+        self.foreground_exclusion_y = min(1.0, max(0.0, self.foreground_exclusion_y))
+        self.max_persons = min(30, max(1, self.max_persons))
+        self.switch_interval = min(60.0, max(0.5, self.switch_interval))
+        self.crossfade_duration = min(5.0, max(0.1, self.crossfade_duration))
+
+    def save(self, settings: QSettings):
+        with QMutexLocker(self._lock):
+            for key in self._PERSISTED:
+                settings.setValue(key, getattr(self, key))
+
 
 # ---------------------------------------------------------------------------
 # Video processing thread
@@ -132,6 +202,7 @@ class VideoThread(QThread):
     frame_ready = pyqtSignal(QImage, dict)   # (processed output frame, metadata)
     diag_frame_ready = pyqtSignal(QImage)    # raw input frame with color-coded overlays
     camera_info = pyqtSignal(str)             # e.g. "1920x1080 @ 30fps"
+    status = pyqtSignal(str)                  # human-readable pipeline state / errors
     persons_updated = pyqtSignal(list)        # list of person IDs currently tracked
 
     def __init__(self, state: AppState, parent=None):
@@ -139,9 +210,10 @@ class VideoThread(QThread):
         self._state = state
         self._running = False
 
-        # Pipeline components (re-created on camera change)
+        # Pipeline components.  The detector is created in run() so the heavy
+        # torch/ultralytics import and model load happen off the UI thread.
         self._cap = None
-        self._detector = PoseDetector()
+        self._detector = None
         self._tracker = PersonTracker()
         self._framing: FramingEngine | None = None
         self._smoother = PTZSmoother()
@@ -150,27 +222,47 @@ class VideoThread(QThread):
 
         self._person_index_map: dict[str, int] = {}   # stable color index per person ID
         self._next_person_color_idx: int = 0
+        self._last_person_ids: list[str] = []
 
+        # Primary Focus state
         self._primary_id: str | None = None
-        # Transition state for Primary Focus mode (mirrors switcher logic)
         self._primary_pending_id: str | None = None
         self._primary_pretraveling: bool = False
         self._primary_pretravel_start: float = 0.0
         self._primary_fade_start: float | None = None
         self._primary_last_switch_time: float = time.monotonic()
-        # Search state: entered when primary ID is lost; camera holds position and
-        # slowly zooms out until the primary reappears.  No cut/crossfade occurs.
+        # Search state: entered when the primary is lost; camera holds position and
+        # slowly zooms out until they reappear or someone else is adopted.
         self._searching: bool = False
+        self._search_start: float = 0.0
         # Disabled-mode transition state
         self._disabled_transitioning: bool = False
         self._disabled_transition_start: float | None = None
+
+        # UI backpressure + real frame-rate measurement
+        self._inflight_lock = threading.Lock()
+        self._frames_in_flight = 0
+        self._frame_times: deque[float] = deque(maxlen=60)
 
     # ------------------------------------------------------------------
 
     def run(self):
         self._running = True
+
+        self.status.emit("Loading pose model…")
+        try:
+            from pose_detector import PoseDetector
+            self._detector = PoseDetector()
+            self._detector.warmup()
+        except Exception as e:   # missing package, bad weights file, etc.
+            self.status.emit(f"Could not load pose model: {e}")
+            return
+        self.status.emit(f"Model ready on {self._detector.device}")
+
         settings = self._state.read()
         self._open_camera(settings['camera_index'])
+        last_frame_time = time.monotonic()
+        last_reopen_attempt = 0.0
 
         while self._running:
             settings = self._state.read()
@@ -178,66 +270,121 @@ class VideoThread(QThread):
             # Handle camera change
             if self._state.consume_camera_change():
                 self._open_camera(settings['camera_index'])
-                self._tracker.reset()
-                self._smoother.reset()
-                self._primary_id = None
+                self._reset_tracking()
+                last_frame_time = time.monotonic()
 
-            if self._cap is None or not self._cap.isOpened():
+            now = time.monotonic()
+            if self._cap is None:
+                # Camera unavailable — retry periodically instead of giving up.
+                if now - last_reopen_attempt >= _CAMERA_STALL_SECONDS:
+                    last_reopen_attempt = now
+                    self._open_camera(settings['camera_index'], quiet=True)
+                    if self._cap is not None:
+                        self._reset_tracking()
+                        last_frame_time = now
                 self.msleep(100)
                 continue
 
             ret, frame = self._cap.read()
-            if not ret:
-                self.msleep(10)
+            if not ret or frame is None:
+                if now - last_frame_time >= _CAMERA_STALL_SECONDS:
+                    self.status.emit(
+                        f"No signal from camera {settings['camera_index']} — reconnecting…")
+                    self._release_camera()
+                    last_reopen_attempt = now
+                else:
+                    self.msleep(10)
                 continue
+            last_frame_time = now
+            self._frame_times.append(now)
 
             result = self._process_frame(frame, settings)
-            if result is not None:
-                qimg, meta = result
-                self.frame_ready.emit(qimg, meta)
-
             self._frame_count += 1
+            if result is None:
+                continue
+            qimg, meta = result
+
+            # Drop frames the UI hasn't caught up with instead of queueing them.
+            with self._inflight_lock:
+                if self._frames_in_flight >= _MAX_FRAMES_IN_FLIGHT:
+                    continue
+                self._frames_in_flight += 1
+            self.frame_ready.emit(qimg, meta)
+
+    def frame_consumed(self):
+        """Called by the UI thread after it has painted a frame."""
+        with self._inflight_lock:
+            self._frames_in_flight = max(0, self._frames_in_flight - 1)
 
     def stop(self):
         self._running = False
-        self.wait()
-        if self._cap:
-            self._cap.release()
+        # cap.read() can block indefinitely on a stalled device; don't let that
+        # hang application shutdown.
+        if not self.wait(3000):
+            self.terminate()
+            self.wait(1000)
+        self._release_camera()
 
     # ------------------------------------------------------------------
-    # Camera open
+    # Camera open / reset
     # ------------------------------------------------------------------
 
-    def _open_camera(self, index: int):
-        if self._cap:
-            self._cap.release()
-        self._cap = cv2.VideoCapture(index)
-        if not self._cap.isOpened():
-            self._cap = None
+    def _release_camera(self):
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+        self._cap = None
+
+    def _open_camera(self, index: int, quiet: bool = False):
+        self._release_camera()
+        self._cap = open_capture(index)
+        if self._cap is None:
+            self.camera_info.emit("not available")
+            if not quiet:
+                self.status.emit(f"Could not open camera {index}")
             return
-        w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = self._cap.get(cv2.CAP_PROP_FPS) or 30
+        w, h, fps = describe_capture(self._cap)
         self._framing = FramingEngine(w, h)
         self.camera_info.emit(f"{w}×{h} @ {fps:.0f} fps")
+        self.status.emit(f"Camera {index} ready")
+
+    def _reset_tracking(self):
+        """Forget everything about the previous scene (camera change / reconnect)."""
+        self._tracker.reset()
+        self._smoother.reset()
+        self._switcher = VirtualSwitcher()
+        self._primary_id = None
+        self._clear_primary_transition()
+        self._searching = False
+        self._person_index_map.clear()
+        self._next_person_color_idx = 0
+        self._last_person_ids = []
+        self._disabled_transitioning = False
+        self._disabled_transition_start = None
+
+    def _measured_fps(self) -> float:
+        if len(self._frame_times) < 2:
+            return 0.0
+        span = self._frame_times[-1] - self._frame_times[0]
+        return (len(self._frame_times) - 1) / span if span > 0 else 0.0
 
     # ------------------------------------------------------------------
     # Per-frame pipeline
     # ------------------------------------------------------------------
 
     def _process_frame(self, frame: np.ndarray, settings: dict):
-        h, w = frame.shape[:2]
-        t0 = time.monotonic()
-
-        # Pose detection (every DETECTION_INTERVAL frames)
+        # Detection only runs every DETECTION_INTERVAL frames; in between we keep
+        # following the last known track positions (tracks expire on wall time).
         if self._frame_count % config.DETECTION_INTERVAL == 0:
             detections = self._detector.detect(frame)
+            persons = self._tracker.update(
+                detections, frame.shape,
+                foreground_exclusion_y=settings.get('foreground_exclusion_y', 0.0),
+                max_persons=settings.get('max_persons', config.MAX_PERSONS))
         else:
-            detections = []
-
-        persons = self._tracker.update(detections, frame.shape,
-                                       foreground_exclusion_y=settings.get('foreground_exclusion_y', 0.0),
-                                       max_persons=settings.get('max_persons', config.MAX_PERSONS))
+            persons = self._tracker.get_all()
 
         # Sync switcher settings from UI state
         self._switcher.switch_mode = settings['switch_mode']
@@ -250,8 +397,11 @@ class VideoThread(QThread):
         if manual_id:
             self._switcher.force_switch(manual_id)
 
-        # Emit tracked person IDs for UI person buttons
-        self.persons_updated.emit([p.id for p in persons])
+        # Tell the UI which people exist — only when the set actually changes
+        ids = [p.id for p in persons]
+        if ids != self._last_person_ids:
+            self._last_person_ids = ids
+            self.persons_updated.emit(ids)
 
         # Assign stable color indices to new person IDs
         for p in persons:
@@ -264,69 +414,27 @@ class VideoThread(QThread):
         auto_enabled = settings.get('auto_follow_enabled', True)
 
         if not auto_enabled:
-            sw_mode = settings['switch_mode']
-            xfade_dur = settings['crossfade_duration']
-            tx, ty, tz = self._framing._default_target()
-
-            # On the first frame of a disable, seed the from-smoother with the
-            # current live camera position so the transition starts from there.
-            if not self._disabled_transitioning:
-                self._disabled_transitioning = True
-                live = self._smoother.get_state('primary')
-                seed = dict(live) if live else {'x': tx, 'y': ty, 'zoom': tz}
-                self._smoother._state['__disabled_from__'] = seed
-                if sw_mode == 'crossfade':
-                    self._disabled_transition_start = time.monotonic()
-                else:
-                    self._disabled_transition_start = None  # cut: skip blend
-
-            if self._disabled_transition_start is not None:
-                elapsed_t = time.monotonic() - self._disabled_transition_start
-                t = min(1.0, elapsed_t / max(xfade_dur, 0.001))
-                px, py, pz = self._smoother.update('__passthrough__', tx, ty, tz)
-                frame_to = self._framing.apply_crop(frame, px, py, pz)
-                if t < 1.0:
-                    fx, fy, fz = self._smoother.update('__disabled_from__', tx, ty, tz)
-                    frame_from = self._framing.apply_crop(frame, fx, fy, fz)
-                    output_frame = cv2.addWeighted(frame_from, 1.0 - t, frame_to, t, 0)
-                else:
-                    self._disabled_transition_start = None
-                    output_frame = frame_to
-            else:
-                px, py, pz = self._smoother.update('__passthrough__', tx, ty, tz)
-                output_frame = self._framing.apply_crop(frame, px, py, pz)
-
-            # Emit diagnostics frame even in disabled mode
-            diag_frame = self._annotate_diag_frame(frame, persons,
-                                                    self._primary_id or '',
-                                                    self._person_index_map,
-                                                    settings.get('foreground_exclusion_y', 0.0))
-            self.diag_frame_ready.emit(_bgr_to_qimage(diag_frame))
-
-            elapsed = time.monotonic() - t0
-            fps = 1.0 / elapsed if elapsed > 0 else 0.0
-            return _bgr_to_qimage(output_frame), {
-                'fps': fps, 'n_persons': len(persons), 'active_id': 'disabled'
-            }
-
-        # Auto-follow enabled — clear disabled transition state so next disable starts fresh
-        self._disabled_transitioning = False
-        self._disabled_transition_start = None
-
-        if mode == 'primary' or not persons:
-            output_frame = self._render_primary(frame, persons, shot_type, settings)
-            active_id = self._primary_id if self._primary_id else (persons[0].id if persons else 'none')
+            output_frame = self._render_disabled(frame, settings)
+            active_id = 'disabled'
+            mode = 'disabled'
         else:
-            output_frame, active_id = self._render_switcher(frame, persons, shot_type)
+            # Clear disabled transition state so the next disable starts fresh
+            self._disabled_transitioning = False
+            self._disabled_transition_start = None
 
-        # Emit the color-coded diagnostics preview (raw input + overlays, never cropped)
-        diag_frame = self._annotate_diag_frame(frame, persons, active_id,
-                                               self._person_index_map,
-                                               settings.get('foreground_exclusion_y', 0.0))
-        self.diag_frame_ready.emit(_bgr_to_qimage(diag_frame))
+            if mode == 'primary' or not persons:
+                output_frame = self._render_primary(frame, persons, shot_type, settings)
+                active_id = self._primary_id or 'none'
+            else:
+                output_frame, active_id = self._render_switcher(frame, persons, shot_type)
 
-        elapsed = time.monotonic() - t0
-        fps = 1.0 / elapsed if elapsed > 0 else 0.0
+        # Diagnostics preview — only built when someone is looking at it.
+        if settings.get('diag_visible'):
+            diag_frame = self._annotate_diag_frame(
+                frame, persons, active_id, self._person_index_map,
+                settings.get('foreground_exclusion_y', 0.0),
+                overlays=settings.get('diag_overlays', True))
+            self.diag_frame_ready.emit(_bgr_to_qimage(diag_frame))
 
         # Build per-person diagnostics list for the diagnostics panel
         persons_diag = []
@@ -345,17 +453,16 @@ class VideoThread(QThread):
                 'frames_unseen': p.frames_unseen,
             })
 
-        dwell_elapsed = time.monotonic() - self._primary_last_switch_time
         meta = {
-            'fps': fps,
+            'fps': self._measured_fps(),
             'n_persons': len(persons),
             'active_id': active_id,
             'persons': persons_diag,
             'primary_id': self._primary_id,
             'pending_id': self._primary_pending_id,
             'pretraveling': self._primary_pretraveling,
-            'dwell_elapsed': dwell_elapsed,
-            'dwell_threshold': 3.0,
+            'dwell_elapsed': time.monotonic() - self._primary_last_switch_time,
+            'dwell_threshold': config.PRIMARY_DWELL_SECONDS,
             'mode': mode,
             'smoother_primary': self._smoother.get_state('primary'),
             'searching': self._searching,
@@ -370,8 +477,9 @@ class VideoThread(QThread):
     @staticmethod
     def _annotate_diag_frame(frame: np.ndarray, persons, primary_id: str,
                               person_index_map: dict,
-                              foreground_exclusion_y: float = 0.0) -> np.ndarray:
-        """Render color-coded skeleton overlays on the raw input frame.
+                              foreground_exclusion_y: float = 0.0,
+                              overlays: bool = True) -> np.ndarray:
+        """Render color-coded skeleton overlays on a downscaled copy of the input.
 
         Each person gets a unique hue (golden-angle spacing).  The body
         silhouette — convex hull of all visible keypoints — is filled with a
@@ -382,8 +490,19 @@ class VideoThread(QThread):
         This output is only ever sent to the diagnostics preview; it never
         touches the main output pipeline.
         """
-        h, w = frame.shape[:2]
-        out = frame.copy()
+        src_h, src_w = frame.shape[:2]
+        if src_w > _DIAG_MAX_WIDTH:
+            s = _DIAG_MAX_WIDTH / src_w
+            out = cv2.resize(frame, (_DIAG_MAX_WIDTH, max(1, int(src_h * s))),
+                             interpolation=cv2.INTER_AREA)
+        else:
+            s = 1.0
+            out = frame.copy()
+        h, w = out.shape[:2]
+
+        if not overlays:
+            return out
+
         overlay = out.copy()
 
         for person in persons:
@@ -413,7 +532,7 @@ class VideoThread(QThread):
                 cv2.circle(out, pt, 4, (255, 255, 255), 1, cv2.LINE_AA)
 
             # ── Bbox outline ─────────────────────────────────────────────
-            bx1, by1, bx2, by2 = person.bbox
+            bx1, by1, bx2, by2 = (int(v * s) for v in person.bbox)
             is_primary = person.id == primary_id
             border_thickness = 3 if is_primary else 1
             cv2.rectangle(out, (bx1, by1), (bx2, by2), color, border_thickness, cv2.LINE_AA)
@@ -424,16 +543,13 @@ class VideoThread(QThread):
                 arrow_tip_y = by1 - 6
                 arrow_base_y = arrow_tip_y - 18
                 arrow_half_w = 10
-                # Filled downward-pointing triangle (arrow head)
                 tri = np.array([
-                    [cx_p,              arrow_tip_y],
+                    [cx_p,                arrow_tip_y],
                     [cx_p - arrow_half_w, arrow_base_y],
                     [cx_p + arrow_half_w, arrow_base_y],
                 ], dtype=np.int32)
-                cv2.fillConvexPoly(overlay, tri, (255, 255, 255))
                 cv2.polylines(out, [tri], True, color, 2, cv2.LINE_AA)
                 cv2.fillConvexPoly(out, tri, color)
-                # Bright halo ring at centroid
                 cy_p = (by1 + by2) // 2
                 cv2.circle(out, (cx_p, cy_p), 10, (255, 255, 255), 3, cv2.LINE_AA)
                 cv2.circle(out, (cx_p, cy_p), 10, color,           2, cv2.LINE_AA)
@@ -458,100 +574,179 @@ class VideoThread(QThread):
             excl_y = int(h * (1.0 - foreground_exclusion_y))
             yellow = (0, 220, 220)  # BGR yellow
 
-            # Semi-transparent filled region with diagonal hatching
-            excl_overlay = out.copy()
-            cv2.rectangle(excl_overlay, (0, excl_y), (w, h), yellow, -1)
-            cv2.addWeighted(excl_overlay, 0.15, out, 0.85, 0, out)
-
-            # Diagonal stripes over the exclusion region
-            stripe_overlay = out.copy()
-            stripe_gap = 18
-            for x_start in range(-h, w, stripe_gap):
-                pt1 = (x_start, excl_y)
-                pt2 = (x_start + (h - excl_y), h)
-                cv2.line(stripe_overlay, pt1, pt2, yellow, 1, cv2.LINE_AA)
-            cv2.addWeighted(stripe_overlay, 0.45, out, 0.55, 0, out)
-
-            # Solid border line along the top edge of the exclusion zone
+            # Semi-transparent tint + diagonal hatching, drawn only on the band
+            # itself rather than blending the whole frame.
+            band = out[excl_y:h, :]
+            if band.size:
+                tinted = band.copy()
+                tinted[:] = yellow
+                cv2.addWeighted(tinted, 0.15, band, 0.85, 0, band)
+                stripes = band.copy()
+                band_h = h - excl_y
+                for x_start in range(-band_h, w, 18):
+                    cv2.line(stripes, (x_start, 0), (x_start + band_h, band_h),
+                             yellow, 1, cv2.LINE_AA)
+                cv2.addWeighted(stripes, 0.45, band, 0.55, 0, band)
             cv2.line(out, (0, excl_y), (w, excl_y), yellow, 2, cv2.LINE_AA)
 
         return out
 
     # ------------------------------------------------------------------
-    # Render modes
+    # Render helpers
     # ------------------------------------------------------------------
 
-    def _render_primary(self, frame, persons, shot_type, settings: dict | None = None):
+    def _follow(self, key: str, person, shot_type: str) -> tuple[float, float, float]:
+        """Advance smoother `key` toward `person`'s framing target; return (x, y, zoom)."""
+        tx, ty, tz = self._framing.calculate_target(person, shot_type)
+        return self._smoother.update(
+            key, tx, ty, tz,
+            person_center_x=_bbox_center_x(person),
+            crop_width=config.OUTPUT_WIDTH / tz,
+        )
+
+    def _held(self, key: str) -> tuple[float, float, float]:
+        s = self._smoother.get_state(key)
+        return s['x'], s['y'], s['zoom']
+
+    def _render_disabled(self, frame, settings: dict):
+        """Auto-follow off: ease out to the full-frame wide shot and stay there."""
+        sw_mode = settings['switch_mode']
+        xfade_dur = settings['crossfade_duration']
+        tx, ty, tz = self._framing.default_target()
+
+        # On the first frame of a disable, seed the from-smoother with the
+        # current live camera position so the transition starts from there.
+        if not self._disabled_transitioning:
+            self._disabled_transitioning = True
+            live = self._smoother.get_state('primary')
+            if live:
+                self._smoother.seed('__disabled_from__', live['x'], live['y'], live['zoom'])
+            else:
+                self._smoother.seed('__disabled_from__', tx, ty, tz)
+            self._smoother.seed('__passthrough__', tx, ty, tz)
+            self._disabled_transition_start = (
+                time.monotonic() if sw_mode == 'crossfade' else None)
+
+        px, py, pz = self._smoother.update('__passthrough__', tx, ty, tz)
+        frame_to = self._framing.apply_crop(frame, px, py, pz)
+
+        if self._disabled_transition_start is not None:
+            t = min(1.0, (time.monotonic() - self._disabled_transition_start)
+                    / max(xfade_dur, 0.001))
+            if t < 1.0:
+                fx, fy, fz = self._smoother.update('__disabled_from__', tx, ty, tz)
+                frame_from = self._framing.apply_crop(frame, fx, fy, fz)
+                return cv2.addWeighted(frame_from, 1.0 - t, frame_to, t, 0)
+            self._disabled_transition_start = None
+        return frame_to
+
+    # ------------------------------------------------------------------
+    # Primary Focus mode
+    # ------------------------------------------------------------------
+
+    def _clear_primary_transition(self):
+        self._primary_pending_id = None
+        self._primary_pretraveling = False
+        self._primary_fade_start = None
+
+    def _begin_primary_transition(self, target_id: str, now: float):
+        self._primary_pending_id = target_id
+        self._primary_pretraveling = True
+        self._primary_pretravel_start = now
+        self._primary_fade_start = None
+
+    def _commit_primary(self, now: float):
+        """Make the pending subject the primary, carrying its camera position over.
+
+        Without copying the smoother state the 'primary' camera would still be
+        parked on the old subject after the cut/crossfade and visibly pan across.
+        """
+        pending = self._primary_pending_id
+        self._smoother.copy_state(pending, 'primary', remove_src=True)
+        self._primary_id = pending
+        self._primary_last_switch_time = now
+        self._searching = False
+        self._clear_primary_transition()
+
+    def _primary_shot(self, frame, persons, shot_type):
+        """Crop for the current primary: follow them if visible, else hold position."""
+        person = next((p for p in persons if p.id == self._primary_id), None)
+        if person is not None:
+            x, y, z = self._follow('primary', person, shot_type)
+        else:
+            x, y, z = self._held('primary')
+        return self._framing.apply_crop(frame, x, y, z)
+
+    def _search_zoom_out(self):
+        """Nudge the held camera wider, keeping the crop centered on the same spot."""
+        state = self._smoother.get_state('primary')
+        old_zoom = state['zoom']
+        new_zoom = max(self._framing.min_zoom, old_zoom - _SEARCH_ZOOM_OUT_RATE)
+        if new_zoom == old_zoom:
+            return
+        new_w = config.OUTPUT_WIDTH / new_zoom
+        new_h = config.OUTPUT_HEIGHT / new_zoom
+        x = state['x'] - (new_w - config.OUTPUT_WIDTH / old_zoom) / 2.0
+        y = state['y'] - (new_h - config.OUTPUT_HEIGHT / old_zoom) / 2.0
+        # Keep the stored position inside the frame so the next pan starts moving
+        # immediately instead of first "travelling" through clamped-off space.
+        state['x'] = min(max(0.0, x), max(0.0, self._framing.input_width - new_w))
+        state['y'] = min(max(0.0, y), max(0.0, self._framing.input_height - new_h))
+        state['zoom'] = new_zoom
+
+    def _render_primary(self, frame, persons, shot_type, settings: dict):
         """Track the nearest (largest bbox) person as primary.
 
         Primary persistence:
-          - Stays on current subject until it leaves the frame entirely.
-          - Switches to a closer subject when foreground_score > current * 1.15
-            (i.e. ~15% bigger bbox area), OR same-distance but 2× more active.
-          - All transitions use the same cut/crossfade pipeline as VirtualSwitcher.
+          - Stays on the current subject while they are visible.
+          - Switches to a closer subject when their foreground_score is ≥1.5×
+            the current one, or when they are ≥2× more active — but only after
+            PRIMARY_DWELL_SECONDS on the current subject.
+          - All switches use the same pretravel → cut/crossfade pipeline as
+            VirtualSwitcher, and the new subject's camera position is carried
+            over so nothing pans after the transition.
 
-        No-subject wide-shot:
-          - When no persons are detected, crossfade to a full-width wide shot.
-          - After a subject reappears, hold the wide shot for at least xfade_dur
-            seconds before re-acquiring, giving the transition time to breathe.
+        Losing the subject:
+          - The camera holds its position and slowly zooms out (search).
+          - If the subject is back within PRIMARY_REACQUIRE_DELAY nothing changes;
+            otherwise the best remaining person is adopted via a transition.
         """
-        sw_mode = (settings or {}).get('switch_mode', 'crossfade')
-        xfade_dur = (settings or {}).get('crossfade_duration', self._switcher.crossfade_duration)
+        sw_mode = settings.get('switch_mode', 'crossfade')
+        xfade_dur = settings.get('crossfade_duration', 1.0)
         now = time.monotonic()
 
-        from switcher import _PRETRAVEL_DURATION
+        # Start on the wide shot so the first acquisition is a push-in, not a snap.
+        if self._smoother.get_state('primary') is None:
+            self._smoother.seed('primary', *self._framing.default_target())
 
-        # How fast to zoom out each frame while searching (zoom units/frame).
-        # At 30fps this reaches _MIN_ZOOM=0.5 from zoom=3 in ~83 frames (~2.8s).
-        _SEARCH_ZOOM_OUT_RATE = 0.008
+        by_id = {p.id: p for p in persons}
+        primary_present = self._primary_id in by_id
 
-        # ----------------------------------------------------------------
-        # Search mode: primary lost — hold pan/tilt, zoom out slowly
-        # ----------------------------------------------------------------
-        current_ids = {p.id for p in persons}
-
-        primary_present = self._primary_id is not None and self._primary_id in current_ids
-
-        if not primary_present:
-            # Enter search if not already in it
+        # ── Search / reacquire ───────────────────────────────────────────
+        if not primary_present and self._primary_pending_id is None:
             if not self._searching:
                 self._searching = True
-                self._primary_pending_id = None
-                self._primary_pretraveling = False
-                self._primary_fade_start = None
-
-            # Try to adopt the first available person as primary once we have one
-            if persons and self._primary_id is None:
-                self._primary_id = persons[0].id
-                self._primary_last_switch_time = now
-                self._searching = False
+                self._search_start = now
+            candidate = persons[0] if persons else None
+            waited = now - self._search_start
+            if candidate is not None and (
+                    self._primary_id is None or waited >= config.PRIMARY_REACQUIRE_DELAY):
+                self._begin_primary_transition(candidate.id, now)
             else:
-                # Hold current position; nudge zoom out toward _MIN_ZOOM
-                state = self._smoother.get_state('primary')
-                if state is not None:
-                    from framing_engine import _MIN_ZOOM
-                    state['zoom'] = max(_MIN_ZOOM, state['zoom'] - _SEARCH_ZOOM_OUT_RATE)
-                    return self._framing.apply_crop(frame, state['x'], state['y'], state['zoom'])
-                else:
-                    # No smoother state yet — nothing to show
-                    return frame
-
-        # Primary reappeared — exit search mode
-        if self._searching:
+                self._search_zoom_out()
+                return self._primary_shot(frame, persons, shot_type)
+        elif primary_present and self._searching:
             self._searching = False
-            self._primary_last_switch_time = now
 
-        current_p = next((p for p in persons if p.id == self._primary_id), persons[0])
-
-        # --- Candidate selection: nearest (by fg_score) or significantly more active ---
-        # persons[] is sorted foreground_score desc (nearest = persons[0])
-        # fg_ratio thresholds use hysteresis: a higher bar to initiate a switch than
-        # was required to arrive at the current primary, preventing oscillation when two
-        # people have similar sizes.  Both fg_score and activity_score are EMA-smoothed
-        # in the tracker so single-frame noise doesn't trigger a switch.
-        nearest = persons[0]
-        if nearest.id != self._primary_id and self._primary_pending_id is None:
-            if now - self._primary_last_switch_time >= 3.0:
+        # ── Candidate selection (steady state only) ──────────────────────
+        # persons[] is sorted foreground_score desc (nearest = persons[0]).
+        # Both scores are EMA-smoothed in the tracker so single-frame noise
+        # can't trigger a switch, and the dwell time prevents ping-ponging.
+        if primary_present and self._primary_pending_id is None and persons:
+            current_p = by_id[self._primary_id]
+            nearest = persons[0]
+            if (nearest.id != self._primary_id
+                    and now - self._primary_last_switch_time >= config.PRIMARY_DWELL_SECONDS):
                 fg_ratio = nearest.foreground_score / max(current_p.foreground_score, 1e-6)
                 cand_act = nearest.activity_score
                 curr_act = current_p.activity_score
@@ -560,80 +755,43 @@ class VideoThread(QThread):
                 # Activity switch: candidate must clear a noise floor AND be 2× more active.
                 activity_wins = cand_act >= 5.0 and cand_act > curr_act * 2.0
                 if fg_wins or activity_wins:
-                    self._primary_pending_id = nearest.id
-                    self._primary_pretraveling = True
-                    self._primary_pretravel_start = now
-                    self._primary_fade_start = None
+                    self._begin_primary_transition(nearest.id, now)
 
-        # --- Phase 1: pretravel ---
-        if self._primary_pretraveling:
-            pending_person = next((p for p in persons if p.id == self._primary_pending_id), None)
-            if pending_person:
-                ptx, pty, ptz = self._framing.calculate_target(pending_person, shot_type)
-                cx_p = (pending_person.bbox[0] + pending_person.bbox[2]) / 2.0
-                cw_p = config.OUTPUT_WIDTH / ptz
-                self._smoother.update(self._primary_pending_id, ptx, pty, ptz,
-                                      person_center_x=cx_p, crop_width=cw_p)
-            if now - self._primary_pretravel_start >= _PRETRAVEL_DURATION:
-                self._primary_pretraveling = False
-                if sw_mode == 'cut':
-                    self._primary_id = self._primary_pending_id
-                    self._primary_pending_id = None
-                    self._primary_last_switch_time = now
-                else:
+        # ── Transition: pretravel → cut / crossfade ──────────────────────
+        if self._primary_pending_id is not None:
+            pending = by_id.get(self._primary_pending_id)
+            if pending is None:
+                # Pending subject vanished before we got there — abort; if the
+                # primary is gone too, the next frame re-enters search.
+                self._smoother.reset(self._primary_pending_id)
+                self._clear_primary_transition()
+                return self._primary_shot(frame, persons, shot_type)
+
+            px, py, pz = self._follow(self._primary_pending_id, pending, shot_type)
+            frame_active = self._primary_shot(frame, persons, shot_type)
+
+            if self._primary_pretraveling:
+                if now - self._primary_pretravel_start >= _PRETRAVEL_DURATION:
+                    self._primary_pretraveling = False
+                    if sw_mode == 'cut':
+                        self._commit_primary(now)
+                        return self._framing.apply_crop(frame, px, py, pz)
                     self._primary_fade_start = now
-            primary = next((p for p in persons if p.id == self._primary_id), persons[0])
-            tx, ty, tz = self._framing.calculate_target(primary, shot_type)
-            cx = (primary.bbox[0] + primary.bbox[2]) / 2.0
-            cw = config.OUTPUT_WIDTH / tz
-            sx, sy, sz = self._smoother.update('primary', tx, ty, tz,
-                                               person_center_x=cx, crop_width=cw)
-            return self._framing.apply_crop(frame, sx, sy, sz)
+                return frame_active
 
-        # --- Phase 2: crossfade to new primary ---
-        if self._primary_pending_id is not None and self._primary_fade_start is not None:
-            elapsed = now - self._primary_fade_start
-            t = min(1.0, elapsed / max(xfade_dur, 0.001))
-
-            primary = next((p for p in persons if p.id == self._primary_id), persons[0])
-            atx, aty, atz = self._framing.calculate_target(primary, shot_type)
-            cx_a = (primary.bbox[0] + primary.bbox[2]) / 2.0
-            cw_a = config.OUTPUT_WIDTH / atz
-            ax, ay, az = self._smoother.update('primary', atx, aty, atz,
-                                               person_center_x=cx_a, crop_width=cw_a)
-            frame_active = self._framing.apply_crop(frame, ax, ay, az)
-
-            pending_person = next((p for p in persons if p.id == self._primary_pending_id), None)
-            if pending_person:
-                ptx, pty, ptz = self._framing.calculate_target(pending_person, shot_type)
-                cx_p = (pending_person.bbox[0] + pending_person.bbox[2]) / 2.0
-                cw_p = config.OUTPUT_WIDTH / ptz
-                px, py, pz = self._smoother.update(self._primary_pending_id, ptx, pty, ptz,
-                                                   person_center_x=cx_p, crop_width=cw_p)
-                frame_pending = self._framing.apply_crop(frame, px, py, pz)
-                blended = cv2.addWeighted(frame_active, 1.0 - t, frame_pending, t, 0)
-            else:
-                blended = frame_active
-                t = 1.0
-
+            t = min(1.0, (now - self._primary_fade_start) / max(xfade_dur, 0.001))
+            frame_pending = self._framing.apply_crop(frame, px, py, pz)
             if t >= 1.0:
-                self._primary_id = self._primary_pending_id
-                self._primary_pending_id = None
-                self._primary_fade_start = None
-                self._primary_last_switch_time = now
+                self._commit_primary(now)
+                return frame_pending
+            return cv2.addWeighted(frame_active, 1.0 - t, frame_pending, t, 0)
 
-            return blended
+        # ── Steady state: follow primary ─────────────────────────────────
+        return self._primary_shot(frame, persons, shot_type)
 
-        # --- Steady state: follow primary ---
-        primary = next((p for p in persons if p.id == self._primary_id), persons[0])
-        tx, ty, tz = self._framing.calculate_target(primary, shot_type)
-        center_x = (primary.bbox[0] + primary.bbox[2]) / 2.0
-        crop_w = config.OUTPUT_WIDTH / tz
-        sx, sy, sz = self._smoother.update(
-            'primary', tx, ty, tz,
-            person_center_x=center_x, crop_width=crop_w
-        )
-        return self._framing.apply_crop(frame, sx, sy, sz)
+    # ------------------------------------------------------------------
+    # Virtual switcher mode
+    # ------------------------------------------------------------------
 
     def _render_switcher(self, frame, persons, shot_type):
         """Virtual switcher: cut or crossfade between tracked persons.
@@ -642,55 +800,34 @@ class VideoThread(QThread):
         frame (pretravel phase) so the virtual camera has already arrived at the
         new subject's position by the time the cut or crossfade fires.
         """
+        by_id = {p.id: p for p in persons}
+
         # Give the switcher the current crop width so it can gate switches by displacement.
-        if self._switcher.active_id:
-            current_person = next((p for p in persons if p.id == self._switcher.active_id), None)
-            if current_person:
-                _, _, cur_zoom = self._framing.calculate_target(current_person, shot_type)
-                self._switcher.current_crop_width = config.OUTPUT_WIDTH / cur_zoom
+        current_person = by_id.get(self._switcher.active_id)
+        if current_person is not None:
+            _, _, cur_zoom = self._framing.calculate_target(current_person, shot_type)
+            self._switcher.current_crop_width = config.OUTPUT_WIDTH / cur_zoom
 
         active_id = self._switcher.decide(persons)
-
-        # Render active person
-        active_person = next((p for p in persons if p.id == active_id), persons[0])
-        atx, aty, atz = self._framing.calculate_target(active_person, shot_type)
-        cx_a = (active_person.bbox[0] + active_person.bbox[2]) / 2.0
-        cw_a = config.OUTPUT_WIDTH / atz
-        ax, ay, az = self._smoother.update(
-            active_id, atx, aty, atz,
-            person_center_x=cx_a, crop_width=cw_a
-        )
+        active_person = by_id.get(active_id, persons[0])
+        ax, ay, az = self._follow(active_id, active_person, shot_type)
         frame_active = self._framing.apply_crop(frame, ax, ay, az)
+
+        pending_person = by_id.get(self._switcher._pending_id)
+        if pending_person is None:
+            return frame_active, active_id
+
+        px, py, pz = self._follow(pending_person.id, pending_person, shot_type)
 
         # Pretravel: advance the pending smoother off-screen so it's settled
         # before the transition becomes visible; keep showing the active frame.
         if self._switcher.is_pretraveling:
-            pending_id = self._switcher._pending_id
-            pending_person = next((p for p in persons if p.id == pending_id), None)
-            if pending_person:
-                ptx, pty, ptz = self._framing.calculate_target(pending_person, shot_type)
-                cx_p = (pending_person.bbox[0] + pending_person.bbox[2]) / 2.0
-                cw_p = config.OUTPUT_WIDTH / ptz
-                self._smoother.update(
-                    pending_id, ptx, pty, ptz,
-                    person_center_x=cx_p, crop_width=cw_p
-                )
             return frame_active, active_id
 
         # Crossfade: blend settled active and pending frames
         if self._switcher.is_transitioning:
-            pending_id = self._switcher._pending_id
-            pending_person = next((p for p in persons if p.id == pending_id), None)
-            if pending_person:
-                ptx, pty, ptz = self._framing.calculate_target(pending_person, shot_type)
-                cx_p = (pending_person.bbox[0] + pending_person.bbox[2]) / 2.0
-                cw_p = config.OUTPUT_WIDTH / ptz
-                px, py, pz = self._smoother.update(
-                    pending_id, ptx, pty, ptz,
-                    person_center_x=cx_p, crop_width=cw_p
-                )
-                frame_pending = self._framing.apply_crop(frame, px, py, pz)
-                return self._switcher.blend(frame_active, frame_pending), active_id
+            frame_pending = self._framing.apply_crop(frame, px, py, pz)
+            return self._switcher.blend(frame_active, frame_pending), active_id
 
         return frame_active, active_id
 
@@ -699,7 +836,8 @@ class VideoThread(QThread):
 # Diagnostics panel
 # ---------------------------------------------------------------------------
 
-_LOG_MAX_LINES = 200   # keep last N switch events in the log
+_LOG_MAX_LINES = 200        # keep last N switch events in the log
+_DIAG_TABLE_INTERVAL = 0.1  # seconds between table/label refreshes (log is per-frame)
 
 
 class DiagnosticsWindow(QMainWindow):
@@ -708,13 +846,15 @@ class DiagnosticsWindow(QMainWindow):
     Updated every frame via update_diagnostics(); never touches the video thread.
     """
 
-    overlays_changed = pyqtSignal(bool)   # emitted when "Show Overlays" is toggled
+    overlays_changed = pyqtSignal(bool)     # emitted when "Show Overlays" is toggled
+    visibility_changed = pyqtSignal(bool)   # emitted on show / hide / close
 
-    def __init__(self, show_overlays: bool = False, parent=None):
+    def __init__(self, show_overlays: bool = True, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Autofollow Diagnostics")
         self.setMinimumSize(640, 640)
         self._last_active_id: str | None = None   # for detecting new switch events
+        self._last_table_update: float = 0.0
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -725,6 +865,8 @@ class DiagnosticsWindow(QMainWindow):
         overlay_row = QHBoxLayout()
         self._overlay_checkbox = QCheckBox("Show Overlays")
         self._overlay_checkbox.setChecked(show_overlays)
+        self._overlay_checkbox.setToolTip(
+            "Draw skeletons, bounding boxes and the exclusion zone on the camera preview.")
         self._overlay_checkbox.stateChanged.connect(
             lambda state: self.overlays_changed.emit(bool(state))
         )
@@ -774,7 +916,7 @@ class DiagnosticsWindow(QMainWindow):
         log_layout = QVBoxLayout(log_box)
         self._log = QTextEdit()
         self._log.setReadOnly(True)
-        self._log.setFont(QFont("Courier", 10))
+        self._log.setFont(QFont("Menlo", 10))
         self._log.setStyleSheet("background:#1e1e1e; color:#d4d4d4;")
         log_layout.addWidget(self._log)
 
@@ -814,8 +956,8 @@ class DiagnosticsWindow(QMainWindow):
         """Called from the UI thread every frame with the metadata dict.
 
         Always processes the switch-event log (so history is captured even
-        when the window is hidden). Skips the table and label updates when
-        the window is not visible to avoid wasted work.
+        when the window is hidden). The table and labels are refreshed at most
+        every _DIAG_TABLE_INTERVAL seconds, and only while visible.
         """
         mode       = meta.get('mode', '?')
         active_id  = meta.get('active_id', '?')
@@ -827,7 +969,7 @@ class DiagnosticsWindow(QMainWindow):
         persons    = meta.get('persons', [])
 
         # Phase string
-        if meta.get('mode') == 'disabled':
+        if mode == 'disabled':
             phase = 'disabled'
         elif meta.get('searching'):
             phase = 'searching'
@@ -846,7 +988,9 @@ class DiagnosticsWindow(QMainWindow):
         dwell_threshold = meta.get('dwell_threshold', 3.0)
         gate_open = dwell >= dwell_threshold
 
-        if self.isVisible():
+        now = time.monotonic()
+        if self.isVisible() and now - self._last_table_update >= _DIAG_TABLE_INTERVAL:
+            self._last_table_update = now
             self._lbl_mode.setText(mode)
             self._lbl_active.setText(primary_id or '—')
             self._lbl_pending.setText(pending_id or '—')
@@ -860,75 +1004,8 @@ class DiagnosticsWindow(QMainWindow):
             else:
                 self._lbl_dwell.setStyleSheet("color: #98c379; font-weight: bold;")
 
-            # ── Per-person table ─────────────────────────────────────────
-            self._table.setRowCount(len(persons))
-            person_index_map = meta.get('person_index_map', {})
-            for row, p in enumerate(persons):
-                pid       = p['id']
-                fg        = p['fg_score']
-                act       = p['activity']
-                fg_ratio  = fg  / max(curr_fg,  1e-6)
-                act_ratio = act / max(curr_act, 1e-6)
-                cx, cy    = p.get('center', (0, 0))
-                unseen    = p.get('frames_unseen', 0)
-                sz        = p.get('smoother_zoom')
-
-                is_active  = pid == primary_id
-                is_pending = pid == pending_id
-
-                # Flag cells that would trigger a switch (for easy reading)
-                fg_trigger  = fg_ratio >= 1.5 and gate_open and not is_active
-                act_trigger = act >= 5.0 and act_ratio >= 2.0 and gate_open and not is_active
-
-                # Person's skeleton color (matches the video overlay).
-                # _person_color uses OpenCV HSV hue 0-179 with step 137.5,
-                # Qt fromHsv uses 0-359, so multiply the same step by 2.
-                p_idx = person_index_map.get(pid, 0)
-                skel_qcolor = QColor.fromHsv(int((p_idx * 275) % 360), 200, 220)
-                swatch_bg = QColor(
-                    skel_qcolor.red()   // 4,
-                    skel_qcolor.green() // 4,
-                    skel_qcolor.blue()  // 4,
-                )
-
-                # Column 0: color swatch (solid person color, narrow)
-                swatch = QTableWidgetItem()
-                swatch.setBackground(skel_qcolor)
-                if is_active:
-                    swatch.setText("▶")
-                    swatch.setForeground(QColor(0, 0, 0))
-                swatch.setTextAlignment(Qt.AlignCenter)
-                self._table.setItem(row, 0, swatch)
-
-                cells = [
-                    pid,
-                    f"{fg:.4f}",
-                    f"{act:.2f}",
-                    f"{'!' if fg_trigger  else ''}{fg_ratio:.2f}",
-                    f"{'!' if act_trigger else ''}{act_ratio:.2f}",
-                    str(unseen),
-                    f"{cx:.0f},{cy:.0f}",
-                    f"{sz:.2f}" if sz is not None else "—",
-                ]
-                for col, text in enumerate(cells, start=1):
-                    item = QTableWidgetItem(text)
-                    item.setTextAlignment(Qt.AlignCenter)
-                    if is_active:
-                        item.setBackground(QColor(40, 80, 40))
-                        item.setForeground(skel_qcolor)
-                    elif is_pending:
-                        item.setBackground(QColor(80, 60, 20))
-                        item.setForeground(skel_qcolor)
-                    elif fg_trigger or act_trigger:
-                        item.setBackground(QColor(80, 40, 40))
-                        item.setForeground(skel_qcolor)
-                    else:
-                        item.setBackground(swatch_bg)
-                        item.setForeground(skel_qcolor)
-                    self._table.setItem(row, col, item)
-
-            # Fix swatch column to a narrow fixed width
-            self._table.setColumnWidth(0, 22)
+            self._refresh_table(persons, meta.get('person_index_map', {}),
+                                primary_id, pending_id, curr_fg, curr_act, gate_open)
 
         # ── Switch event log: append a line when active_id changes ───────
         if active_id != self._last_active_id and active_id not in ('none', 'disabled', None):
@@ -961,6 +1038,83 @@ class DiagnosticsWindow(QMainWindow):
             self._log.ensureCursorVisible()
         self._last_active_id = active_id
 
+    def _refresh_table(self, persons, person_index_map, primary_id, pending_id,
+                       curr_fg, curr_act, gate_open):
+        self._table.setRowCount(len(persons))
+        for row, p in enumerate(persons):
+            pid       = p['id']
+            fg        = p['fg_score']
+            act       = p['activity']
+            fg_ratio  = fg  / max(curr_fg,  1e-6)
+            act_ratio = act / max(curr_act, 1e-6)
+            cx, cy    = p.get('center', (0, 0))
+            unseen    = p.get('frames_unseen', 0)
+            sz        = p.get('smoother_zoom')
+
+            is_active  = pid == primary_id
+            is_pending = pid == pending_id
+
+            # Flag cells that would trigger a switch (for easy reading)
+            fg_trigger  = fg_ratio >= 1.5 and gate_open and not is_active
+            act_trigger = act >= 5.0 and act_ratio >= 2.0 and gate_open and not is_active
+
+            # Person's skeleton color (matches the video overlay).
+            # _person_color uses OpenCV HSV hue 0-179 with step 137.5,
+            # Qt fromHsv uses 0-359, so multiply the same step by 2.
+            p_idx = person_index_map.get(pid, 0)
+            skel_qcolor = QColor.fromHsv(int((p_idx * 275) % 360), 200, 220)
+            swatch_bg = QColor(
+                skel_qcolor.red()   // 4,
+                skel_qcolor.green() // 4,
+                skel_qcolor.blue()  // 4,
+            )
+
+            # Column 0: color swatch (solid person color, narrow)
+            swatch = QTableWidgetItem()
+            swatch.setBackground(skel_qcolor)
+            if is_active:
+                swatch.setText("▶")
+                swatch.setForeground(QColor(0, 0, 0))
+            swatch.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(row, 0, swatch)
+
+            cells = [
+                pid,
+                f"{fg:.4f}",
+                f"{act:.2f}",
+                f"{'!' if fg_trigger  else ''}{fg_ratio:.2f}",
+                f"{'!' if act_trigger else ''}{act_ratio:.2f}",
+                str(unseen),
+                f"{cx:.0f},{cy:.0f}",
+                f"{sz:.2f}" if sz is not None else "—",
+            ]
+            for col, text in enumerate(cells, start=1):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignCenter)
+                if is_active:
+                    item.setBackground(QColor(40, 80, 40))
+                elif is_pending:
+                    item.setBackground(QColor(80, 60, 20))
+                elif fg_trigger or act_trigger:
+                    item.setBackground(QColor(80, 40, 40))
+                else:
+                    item.setBackground(swatch_bg)
+                item.setForeground(skel_qcolor)
+                self._table.setItem(row, col, item)
+
+        # Fix swatch column to a narrow fixed width
+        self._table.setColumnWidth(0, 22)
+
+    # ------------------------------------------------------------------
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.visibility_changed.emit(True)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.visibility_changed.emit(False)
+
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Escape, Qt.Key_Q):
             self.hide()
@@ -973,10 +1127,13 @@ class DiagnosticsWindow(QMainWindow):
 class OutputWindow(QMainWindow):
     """Borderless fullscreen window displaying the processed video output."""
 
+    visibility_changed = pyqtSignal(bool)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Autofollow Output")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setCursor(Qt.BlankCursor)
         self._label = QLabel(self)
         self._label.setAlignment(Qt.AlignCenter)
         self._label.setStyleSheet("background: black;")
@@ -988,9 +1145,20 @@ class OutputWindow(QMainWindow):
             pix.scaled(self._label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         )
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.visibility_changed.emit(True)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.visibility_changed.emit(False)
+
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Escape, Qt.Key_Q):
             self.hide()
+
+    def mouseDoubleClickEvent(self, event):
+        self.hide()
 
 
 # ---------------------------------------------------------------------------
@@ -1005,14 +1173,21 @@ class ControlWindow(QMainWindow):
         self.setWindowTitle("Autofollow")
         self.setMinimumWidth(340)
 
+        self._settings = QSettings("Autofollow", "Autofollow")
         self._state = AppState()
+        self._state.load(self._settings)
+
         self._output_win = OutputWindow()
-        self._diag_win = DiagnosticsWindow(show_overlays=self._state.show_diagnostics)
+        self._output_win.visibility_changed.connect(self._on_output_visibility)
+        self._diag_win = DiagnosticsWindow(show_overlays=self._state.diag_overlays)
         self._diag_win.overlays_changed.connect(self._on_diagnostics_changed)
+        self._diag_win.visibility_changed.connect(self._on_diag_visibility)
+
         self._video_thread = VideoThread(self._state)
         self._video_thread.frame_ready.connect(self._on_frame)
         self._video_thread.diag_frame_ready.connect(self._diag_win.update_video)
         self._video_thread.camera_info.connect(self._on_camera_info)
+        self._video_thread.status.connect(self._on_status)
         self._video_thread.persons_updated.connect(self._on_persons_updated)
 
         self._preview_label = QLabel()
@@ -1020,6 +1195,7 @@ class ControlWindow(QMainWindow):
         self._preview_label.setMinimumSize(320, 180)
         self._preview_label.setStyleSheet("background: black;")
 
+        self._last_status: str = ""
         self._build_ui()
         self._video_thread.start()
 
@@ -1046,9 +1222,10 @@ class ControlWindow(QMainWindow):
         box = QGroupBox("Camera")
         row = QHBoxLayout(box)
         self._cam_combo = QComboBox()
-        self._refresh_cameras()
+        self._refresh_cameras(initial=True)
         self._cam_combo.currentIndexChanged.connect(self._on_camera_changed)
         btn_refresh = QPushButton("Refresh")
+        btn_refresh.setToolTip("Rescan for connected cameras")
         btn_refresh.clicked.connect(self._refresh_cameras)
         self._cam_info_label = QLabel("")
         self._cam_info_label.setStyleSheet("color: gray; font-size: 10px;")
@@ -1057,13 +1234,22 @@ class ControlWindow(QMainWindow):
         row.addWidget(self._cam_info_label)
         return box
 
-    def _refresh_cameras(self):
-        cameras = _scan_cameras()
+    def _refresh_cameras(self, initial: bool = False):
+        # Never re-probe the camera the video thread is streaming from — opening
+        # a device twice can stall the capture.  It is listed without probing.
+        active = set() if initial else {self._state.camera_index}
+        cameras = scan_cameras(skip=active)
+        if initial and self._state.camera_index not in cameras:
+            # Remembered camera is gone (unplugged) — fall back to the first one.
+            if cameras:
+                self._state.camera_index = cameras[0]
+
         self._cam_combo.blockSignals(True)
         self._cam_combo.clear()
         for idx in cameras:
             self._cam_combo.addItem(f"Camera {idx}", idx)
-        # Try to select configured default
+        if not cameras:
+            self._cam_combo.addItem("No cameras found", None)
         for i in range(self._cam_combo.count()):
             if self._cam_combo.itemData(i) == self._state.camera_index:
                 self._cam_combo.setCurrentIndex(i)
@@ -1079,7 +1265,6 @@ class ControlWindow(QMainWindow):
         for label, key in [("Full Body", "full_body"), ("Waist Up", "waist_up"),
                             ("Medium", "medium"), ("Close-Up", "close_up")]:
             self._shot_combo.addItem(label, key)
-        # Set default
         for i in range(self._shot_combo.count()):
             if self._shot_combo.itemData(i) == self._state.shot_type:
                 self._shot_combo.setCurrentIndex(i)
@@ -1091,7 +1276,6 @@ class ControlWindow(QMainWindow):
     # --- Virtual Switcher / Primary Focus settings ---
 
     def _build_switcher_section(self):
-        # No section label — title is implicit from context
         self._switcher_box = QGroupBox("Virtual Switcher")
         layout = QVBoxLayout(self._switcher_box)
 
@@ -1100,12 +1284,11 @@ class ControlWindow(QMainWindow):
         trig_label = QLabel("Mode:")
         self._trig_group = QButtonGroup()
         triggers = [
-            ("Disabled", "disabled"),
-            ("Primary",  "primary"),
-            ("Time",     "time"),
-            ("Manual",   "manual"),
+            ("Disabled", "disabled", "Show the full camera frame; no tracking."),
+            ("Primary",  "primary",  "Follow the closest person; hand off when someone closer or more active appears."),
+            ("Time",     "time",     "Rotate between tracked people on a fixed interval."),
+            ("Manual",   "manual",   "Only switch when you press a person button below."),
         ]
-        # Determine initial checked state
         _valid_triggers = {t[1] for t in triggers}
         current_trigger = (
             "disabled" if not self._state.auto_follow_enabled
@@ -1113,9 +1296,10 @@ class ControlWindow(QMainWindow):
             else self._state.switch_trigger
                 if self._state.switch_trigger in _valid_triggers else "time"
         )
-        for label, key in triggers:
+        for label, key, tip in triggers:
             rb = QRadioButton(label)
             rb.setProperty("trigger_key", key)
+            rb.setToolTip(tip)
             rb.setChecked(key == current_trigger)
             self._trig_group.addButton(rb)
             trig_row.addWidget(rb)
@@ -1162,8 +1346,8 @@ class ControlWindow(QMainWindow):
         layout.addLayout(cf_row)
 
         # Manual person buttons (populated dynamically)
-        manual_label = QLabel("Manual Switch:")
-        layout.addWidget(manual_label)
+        self._manual_label = QLabel("Manual Switch:")
+        layout.addWidget(self._manual_label)
         self._persons_row = QHBoxLayout()
         layout.addLayout(self._persons_row)
         self._person_buttons: dict[str, QPushButton] = {}
@@ -1186,14 +1370,20 @@ class ControlWindow(QMainWindow):
             self._display_combo.addItem(
                 f"Display {i + 1}  ({geo.width()}×{geo.height()})", i
             )
+        if 0 <= self._state.display_index < len(screens):
+            self._display_combo.setCurrentIndex(self._state.display_index)
+        self._display_combo.currentIndexChanged.connect(self._on_display_changed)
         display_row.addWidget(self._display_combo)
         display_row.addStretch()
         layout.addLayout(display_row)
 
         btn_row = QHBoxLayout()
-        btn_fullscreen = QPushButton("Open Fullscreen Output")
-        btn_fullscreen.clicked.connect(self._open_fullscreen)
-        btn_row.addWidget(btn_fullscreen)
+        self._btn_fullscreen = QPushButton("Open Fullscreen Output")
+        self._btn_fullscreen.setToolTip(
+            "Show the program output fullscreen on the selected display.\n"
+            "Press Esc or double-click the output to close it.")
+        self._btn_fullscreen.clicked.connect(self._toggle_fullscreen)
+        btn_row.addWidget(self._btn_fullscreen)
         btn_diag = QPushButton("Open Diagnostics")
         btn_diag.clicked.connect(self._open_diagnostics)
         btn_row.addWidget(btn_diag)
@@ -1204,12 +1394,13 @@ class ControlWindow(QMainWindow):
         excl_row.addWidget(QLabel("Audience Exclusion:"))
         self._excl_slider = QSlider(Qt.Horizontal)
         self._excl_slider.setRange(0, 100)
-        self._excl_slider.setValue(int(self._state.foreground_exclusion_y * 100))
+        self._excl_slider.setValue(int(round(self._state.foreground_exclusion_y * 100)))
         self._excl_slider.setToolTip(
-            "Ignore detections in the bottom N% of the frame (foreground audience filter).\n"
-            "0 = disabled. Increase until stage-front audience members are no longer tracked."
+            "Ignore people whose torso is in the bottom N% of the frame (foreground audience filter).\n"
+            "0 = disabled. Increase until stage-front audience members are no longer tracked.\n"
+            "The zone is shown in yellow in the Diagnostics window."
         )
-        self._excl_value_label = QLabel(f"{int(self._state.foreground_exclusion_y * 100)}%")
+        self._excl_value_label = QLabel(f"{self._excl_slider.value()}%")
         self._excl_value_label.setFixedWidth(32)
         self._excl_slider.valueChanged.connect(self._on_exclusion_changed)
         excl_row.addWidget(self._excl_slider)
@@ -1245,26 +1436,30 @@ class ControlWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_frame(self, qimg: QImage, meta: dict):
-        # Update preview
-        pix = QPixmap.fromImage(qimg)
-        self._preview_label.setPixmap(
-            pix.scaled(self._preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
-        # Update fullscreen output if open
-        if self._output_win.isVisible():
-            self._output_win.update_frame(qimg)
-        # Always feed the diagnostics panel so the log captures events even when hidden.
-        # update_diagnostics() skips the table rebuild when the window is not visible.
-        self._diag_win.update_diagnostics(meta)
-        # Status bar
-        self._status_label.setText(
-            f"FPS: {meta['fps']:.1f}  |  "
-            f"Detected: {meta['n_persons']} person(s)  |  "
-            f"Active: {meta['active_id']}"
-        )
+        try:
+            pix = QPixmap.fromImage(qimg)
+            self._preview_label.setPixmap(
+                pix.scaled(self._preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+            if self._output_win.isVisible():
+                self._output_win.update_frame(qimg)
+            # Always feed the diagnostics panel so the log captures events even when hidden.
+            self._diag_win.update_diagnostics(meta)
+            self._status_label.setText(
+                f"FPS: {meta['fps']:.1f}  |  "
+                f"Tracking: {meta['n_persons']} person(s)  |  "
+                f"Active: {meta['active_id']}"
+                + ("  |  searching…" if meta.get('searching') else "")
+            )
+        finally:
+            self._video_thread.frame_consumed()
 
     def _on_camera_info(self, info: str):
         self._cam_info_label.setText(info)
+
+    def _on_status(self, text: str):
+        self._last_status = text
+        self._status_label.setText(text)
 
     def _on_persons_updated(self, person_ids: list):
         # Rebuild manual person buttons to match currently tracked IDs
@@ -1276,40 +1471,42 @@ class ControlWindow(QMainWindow):
             self._persons_row.removeWidget(btn)
             btn.deleteLater()
 
-        manual_active = self._state.switch_trigger == 'manual' and self._state.tracking_mode == 'switcher'
+        manual_active = self._manual_mode_active()
         for pid in current - existing:
             btn = QPushButton(pid.replace('person', 'P'))
             btn.setFixedWidth(40)
+            btn.setToolTip(f"Switch to {pid}")
             btn.setVisible(manual_active)
             btn.clicked.connect(lambda checked, p=pid: self._manual_switch(p))
             self._person_buttons[pid] = btn
             self._persons_row.addWidget(btn)
 
+    def _manual_mode_active(self) -> bool:
+        return (self._state.auto_follow_enabled
+                and self._state.tracking_mode == 'switcher'
+                and self._state.switch_trigger == 'manual')
+
     def _on_camera_changed(self, idx: int):
         cam_idx = self._cam_combo.itemData(idx)
         if cam_idx is not None:
-            with QMutexLocker(self._state._lock):
-                self._state.camera_index = cam_idx
-                self._state.camera_change_requested = True
+            self._state.set(camera_index=cam_idx, camera_change_requested=True)
+            self._persist()
 
     def _on_shot_changed(self, idx: int):
-        key = self._shot_combo.itemData(idx)
-        with QMutexLocker(self._state._lock):
-            self._state.shot_type = key
+        self._state.set(shot_type=self._shot_combo.itemData(idx))
+        self._persist()
 
     def _on_trigger_changed(self, button):
         key = button.property("trigger_key")
-        with QMutexLocker(self._state._lock):
-            if key == 'disabled':
-                self._state.auto_follow_enabled = False
-            elif key == 'primary':
-                self._state.auto_follow_enabled = True
-                self._state.tracking_mode = 'primary'
-            else:
-                self._state.auto_follow_enabled = True
-                self._state.tracking_mode = 'switcher'
-                self._state.switch_trigger = key
+        if key == 'disabled':
+            self._state.set(auto_follow_enabled=False)
+        elif key == 'primary':
+            self._state.set(auto_follow_enabled=True, tracking_mode='primary')
+        else:
+            self._state.set(auto_follow_enabled=True, tracking_mode='switcher',
+                            switch_trigger=key)
         self._update_trigger_ui(key)
+        self._persist()
 
     def _update_trigger_ui(self, trigger_key: str):
         """Show/hide controls based on selected trigger."""
@@ -1317,45 +1514,71 @@ class ControlWindow(QMainWindow):
         self._interval_label.setVisible(show_interval)
         self._interval_spin.setVisible(show_interval)
         manual_active = trigger_key == 'manual'
+        self._manual_label.setVisible(manual_active)
         for btn in self._person_buttons.values():
             btn.setVisible(manual_active)
 
     def _on_interval_changed(self, val: float):
-        with QMutexLocker(self._state._lock):
-            self._state.switch_interval = val
+        self._state.set(switch_interval=val)
+        self._persist()
 
     def _on_switch_mode_changed(self, button):
-        key = button.property("sm_key")
-        with QMutexLocker(self._state._lock):
-            self._state.switch_mode = key
+        self._state.set(switch_mode=button.property("sm_key"))
+        self._persist()
 
     def _on_crossfade_changed(self, val: float):
-        with QMutexLocker(self._state._lock):
-            self._state.crossfade_duration = val
+        self._state.set(crossfade_duration=val)
+        self._persist()
 
     def _manual_switch(self, person_id: str):
-        with QMutexLocker(self._state._lock):
-            self._state.manual_switch_id = person_id
+        self._state.set(manual_switch_id=person_id)
 
-    def _on_diagnostics_changed(self, state: int):
-        with QMutexLocker(self._state._lock):
-            self._state.show_diagnostics = bool(state)
+    def _on_diagnostics_changed(self, enabled: bool):
+        self._state.set(diag_overlays=bool(enabled))
+        self._persist()
+
+    def _on_diag_visibility(self, visible: bool):
+        self._state.set(diag_visible=bool(visible))
+
+    def _on_output_visibility(self, visible: bool):
+        self._btn_fullscreen.setText(
+            "Close Fullscreen Output" if visible else "Open Fullscreen Output")
 
     def _on_exclusion_changed(self, value: int):
         self._excl_value_label.setText(f"{value}%")
-        with QMutexLocker(self._state._lock):
-            self._state.foreground_exclusion_y = value / 100.0
+        self._state.set(foreground_exclusion_y=value / 100.0)
+        self._persist()
 
     def _on_max_persons_changed(self, value: int):
-        with QMutexLocker(self._state._lock):
-            self._state.max_persons = value
+        self._state.set(max_persons=value)
+        self._persist()
 
-    def _open_fullscreen(self):
+    def _on_display_changed(self, idx: int):
+        self._state.set(display_index=idx)
+        self._persist()
+        if self._output_win.isVisible():
+            self._show_output_on_selected_display()
+
+    def _toggle_fullscreen(self):
+        if self._output_win.isVisible():
+            self._output_win.hide()
+        else:
+            self._show_output_on_selected_display()
+
+    def _show_output_on_selected_display(self):
         screen_index = self._display_combo.currentData()
         screens = QApplication.screens()
-        if 0 <= screen_index < len(screens):
-            geo = screens[screen_index].geometry()
-            self._output_win.setGeometry(geo)
+        if screen_index is None or not (0 <= screen_index < len(screens)):
+            screen_index = 0
+        screen = screens[screen_index]
+        geo = screen.geometry()
+        # Create the native window first so it can be bound to the target screen;
+        # otherwise macOS may pull a fullscreen window back to the primary display.
+        self._output_win.winId()
+        handle = self._output_win.windowHandle()
+        if handle is not None:
+            handle.setScreen(screen)
+        self._output_win.setGeometry(geo)
         self._output_win.showFullScreen()
         self._output_win.raise_()
 
@@ -1363,9 +1586,14 @@ class ControlWindow(QMainWindow):
         self._diag_win.show()
         self._diag_win.raise_()
 
+    def _persist(self):
+        self._state.save(self._settings)
+
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
+        self._persist()
+        self._settings.sync()
         self._video_thread.stop()
         self._output_win.close()
         self._diag_win.close()

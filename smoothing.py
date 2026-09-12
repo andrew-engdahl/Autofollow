@@ -30,10 +30,8 @@ _ZOOM_ALPHA_SCALE = 0.10  # zoom lerp = pan_alpha * this
 _PAN_QUAD_MAX = 0.30
 _REF_PAN_DISTANCE = 300.0   # pixels of subject overshoot at which quad reaches max
 
-# Hard speed caps — pixels (or zoom units) per frame.
-_MAX_PAN_SPEED  = 15    # px/frame  (~450px/s at 30fps — smooth but responsive)
-_MAX_TILT_SPEED = 3     # px/frame
-_MAX_ZOOM_SPEED = 0.015 # zoom units/frame
+# Hard speed caps (source pixels, or zoom units, per frame) come from config so
+# they can be tuned in one place: MAX_PAN_SPEED, MAX_TILT_SPEED, MAX_ZOOM_SPEED.
 
 
 def _pan_alpha() -> float:
@@ -67,7 +65,8 @@ def _pan_step(current: float, target: float, subject_overshoot: float = 1.0) -> 
     normalized = max(0.0, min(1.0, subject_overshoot))
     factor = base + (_PAN_QUAD_MAX - base) * normalized ** 2
     movement = factor * error
-    movement = max(-_MAX_PAN_SPEED, min(_MAX_PAN_SPEED, movement))
+    cap = config.MAX_PAN_SPEED
+    movement = max(-cap, min(cap, movement))
     return current + movement
 
 
@@ -108,11 +107,11 @@ class PTZSmoother:
 
         # ── Y (tilt): slow lerp ──────────────────────────────────────────────
         tilt_alpha = _pan_alpha() * _TILT_ALPHA_SCALE
-        new_y = _lerp_step(curr_y, target_y, tilt_alpha, _MAX_TILT_SPEED)
+        new_y = _lerp_step(curr_y, target_y, tilt_alpha, config.MAX_TILT_SPEED)
 
         # ── Z (zoom): even slower lerp ───────────────────────────────────────
         zoom_alpha = _pan_alpha() * _ZOOM_ALPHA_SCALE
-        new_zoom = _lerp_step(curr_zoom, target_zoom, zoom_alpha, _MAX_ZOOM_SPEED)
+        new_zoom = _lerp_step(curr_zoom, target_zoom, zoom_alpha, config.MAX_ZOOM_SPEED)
 
         state['x'], state['y'], state['zoom'] = new_x, new_y, new_zoom
         return new_x, new_y, new_zoom
@@ -125,6 +124,19 @@ class PTZSmoother:
 
     def get_state(self, person_id: str) -> dict | None:
         return self._state.get(person_id)
+
+    def seed(self, person_id: str, x: float, y: float, zoom: float):
+        """Set a key's camera position directly (no smoothing)."""
+        self._state[person_id] = {'x': float(x), 'y': float(y), 'zoom': float(zoom)}
+
+    def copy_state(self, src_id: str, dst_id: str, remove_src: bool = False):
+        """Make dst_id continue from wherever src_id's camera currently is."""
+        src = self._state.get(src_id)
+        if src is None:
+            return
+        self._state[dst_id] = dict(src)
+        if remove_src:
+            self._state.pop(src_id, None)
 
     @staticmethod
     def _apply_deadzone(current_x: float, target_x: float,

@@ -3,7 +3,7 @@
 import cv2
 import numpy as np
 from config import (
-    OUTPUT_WIDTH, OUTPUT_HEIGHT, OUTPUT_ASPECT_RATIO,
+    OUTPUT_WIDTH, OUTPUT_HEIGHT,
     PADDING_RATIO, SHOT_TYPE, MAX_ZOOM, CONFIDENCE_THRESHOLD,
 )
 from tracker import TrackedPerson
@@ -43,20 +43,24 @@ _SHOT_HEADROOM_FRAC = {
     'close_up':  0.30,
 }
 
-_MIN_ZOOM = 0.5   # allow modest zoom-out to accommodate large full-body shots
-
-
 class FramingEngine:
     """Computes crop targets for single-person and multi-person (wide) shots.
 
     All methods are stateless — they return (target_x, target_y, target_zoom)
     without storing previous positions. Smoothing and deadzone logic live in
     PTZSmoother (smoothing.py).
+
+    Zoom is expressed relative to the output size: zoom 1.0 means the crop is
+    exactly OUTPUT_WIDTH × OUTPUT_HEIGHT source pixels.  `min_zoom` is the
+    zoom at which the crop covers the whole camera frame, so a "wide shot"
+    is genuinely wide whether the camera is 720p or 4K.
     """
 
     def __init__(self, input_width: int, input_height: int):
-        self.input_width = input_width
-        self.input_height = input_height
+        self.input_width = max(1, int(input_width))
+        self.input_height = max(1, int(input_height))
+        self.min_zoom = max(OUTPUT_WIDTH / self.input_width,
+                            OUTPUT_HEIGHT / self.input_height)
 
     # ------------------------------------------------------------------
     # Single-person target
@@ -106,7 +110,8 @@ class FramingEngine:
 
         # Zoom that fits this exact body region into the output height
         required_crop_h = max(1.0, bottom_y - top_y)
-        zoom = float(np.clip(OUTPUT_HEIGHT / required_crop_h, _MIN_ZOOM, MAX_ZOOM))
+        zoom = float(np.clip(OUTPUT_HEIGHT / required_crop_h,
+                             self.min_zoom, max(self.min_zoom, MAX_ZOOM)))
 
         crop_w = OUTPUT_WIDTH / zoom
         crop_h = OUTPUT_HEIGHT / zoom
@@ -129,13 +134,13 @@ class FramingEngine:
     def calculate_wide_target(self, persons: list[TrackedPerson]) -> tuple[float, float, float]:
         """Compute a crop that frames all detected persons.
 
-        Zooms out as needed to fit everyone; respects MAX_ZOOM lower bound (1.0).
+        Zooms out as needed to fit everyone, down to the full frame.
 
         Returns:
             (target_x, target_y, target_zoom)
         """
         if not persons:
-            return self._default_target()
+            return self.default_target()
 
         if len(persons) == 1:
             return self.calculate_target(persons[0])
@@ -158,7 +163,7 @@ class FramingEngine:
         # Zoom needed to fit the union box at 16:9
         zoom_by_width = OUTPUT_WIDTH / max(padded_w, 1.0)
         zoom_by_height = OUTPUT_HEIGHT / max(padded_h, 1.0)
-        zoom = max(1.0, min(zoom_by_width, zoom_by_height, MAX_ZOOM))
+        zoom = max(self.min_zoom, min(zoom_by_width, zoom_by_height, MAX_ZOOM))
 
         crop_w = OUTPUT_WIDTH / zoom
         crop_h = OUTPUT_HEIGHT / zoom
@@ -182,8 +187,9 @@ class FramingEngine:
         Uses INTER_AREA when shrinking (better quality) and INTER_LINEAR when
         zooming in.
         """
-        crop_w = int(OUTPUT_WIDTH / zoom)
-        crop_h = int(OUTPUT_HEIGHT / zoom)
+        zoom = max(zoom, self.min_zoom)   # never ask for a crop larger than the frame
+        crop_w = min(self.input_width, max(1, int(OUTPUT_WIDTH / zoom)))
+        crop_h = min(self.input_height, max(1, int(OUTPUT_HEIGHT / zoom)))
 
         # Clamp origin so the full crop always fits — prevents edge stretching
         xi = int(np.clip(x, 0, max(0, self.input_width - crop_w)))
@@ -198,15 +204,13 @@ class FramingEngine:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _default_target(self) -> tuple[float, float, float]:
-        """Center-frame fallback when nothing is detected."""
-        crop_w = min(OUTPUT_WIDTH, self.input_width)
-        crop_h = min(OUTPUT_HEIGHT, self.input_height)
-        # Maintain 16:9
-        if crop_w / max(crop_h, 1) > OUTPUT_ASPECT_RATIO:
-            crop_w = int(crop_h * OUTPUT_ASPECT_RATIO)
-        else:
-            crop_h = int(crop_w / OUTPUT_ASPECT_RATIO)
+    def default_target(self) -> tuple[float, float, float]:
+        """Wide shot: the largest centered 16:9 region of the camera frame."""
+        crop_w = OUTPUT_WIDTH / self.min_zoom
+        crop_h = OUTPUT_HEIGHT / self.min_zoom
         x = (self.input_width - crop_w) / 2.0
         y = (self.input_height - crop_h) / 2.0
-        return x, y, 1.0
+        return x, y, self.min_zoom
+
+    # Backwards-compatible alias
+    _default_target = default_target
