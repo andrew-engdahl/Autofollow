@@ -1,109 +1,62 @@
-# Autofollow - Quick Start Guide
+# Autofollow — Quick Start
 
-## ✅ Setup Complete!
+## First time
 
-All dependencies have been installed in the virtual environment. You're ready to use Autofollow.
-
-## Getting Started in 3 Steps
-
-### 1. Navigate to the Project
 ```bash
 cd /Users/techbooth/Documents/Autofollow
+./setup.sh
 ```
 
-### 2. Run the App
+## Every time
+
 ```bash
 ./run.sh
 ```
 
-Press **`q`** to exit the preview.
+…or double-click **Autofollow.app**.
 
-### 3. (Optional) Save Video Output
-```bash
-./run.sh --output my_video.mp4
-```
+The control panel appears right away; wait for the status bar to change from *Loading pose model…* to *Camera 0 ready*.
 
-## Common Commands
+## Running a show
+
+1. **Camera** — pick the input. The label next to it shows the resolution/fps it opened at.
+2. **Display** — choose the projector/monitor, then **Open Fullscreen Output**. Esc, Q or double-click on the output closes it.
+3. **Mode**
+   - **Primary** — follows the closest person and hands off automatically. Good default for a single presenter or a panel.
+   - **Time** — rotates between everyone on stage every *Interval* seconds.
+   - **Manual** — press **P1 / P2 / …** to pick who's on screen.
+   - **Disabled** — full wide shot, no tracking.
+4. **Shot Type** and **Transition** can be changed live.
+5. If people in the front row keep getting picked up, raise **Audience Exclusion** until they fall inside the yellow zone in **Diagnostics**.
+
+Everything you set is remembered for next time.
+
+## Command line
 
 | Command | Purpose |
 |---------|---------|
-| `./run.sh` | Live preview of intelligent framing |
-| `./run.sh --list-cameras` | Find available camera devices |
-| `./run.sh --camera 1` | Use alternate camera (device 1) |
-| `./run.sh --output video.mp4` | Save processed video to file |
-| `./run.sh --max-frames 300` | Process only 300 frames |
+| `./run.sh` | Control panel (GUI) |
+| `./run.sh --list-cameras` | Show available camera indices |
+| `./run.sh --headless --output show.mp4` | Record to a file without the GUI |
+| `./run.sh --headless --camera 1 --shot-type full_body` | Headless with options |
+| `./run.sh --headless --no-preview --max-frames 300` | Process 300 frames, no window |
 
-## How It Works
+## Tuning (`config.py`)
 
-1. **Captures video** from your camera (up to 4K support)
-2. **Detects your pose** using Google's MediaPipe ML Kit
-3. **Auto-frames you** in 16:9 medium close-up
-4. **Smooths movement** to create professional camera movement
-5. **Outputs** high-quality 1080p (16:9) video
-
-## Configuration
-
-Edit `config.py` to customize:
-- **SHOT_TYPE** ('medium') - Type of shot: 'full_body', 'waist_up', 'medium', 'close_up'
-- **MAX_ZOOM** (2.5) - Maximum zoom limit
-- **GROUP_FRAMING** (True) - Frame multiple people together if detected
-- **SMOOTHING_FACTOR** (0.15) - Lower = smoother but slower response
-- **PADDING_RATIO** (0.15) - Head space padding around person
-- **MAX_PAN_SPEED** (100) - Maximum camera pan pixels/frame
-- **MAX_ZOOM_SPEED** (0.05) - Maximum zoom change per frame
-
-## Multi-Person Framing
-
-When multiple people are detected in the frame:
-- **Automatic group framing** - Zooms out to fit everyone in the shot
-- **Centered panning** - Frames are centered on the group's center point
-- **Per-person zoom limits** - Respects the SHOT_TYPE setting for the group
-
-To disable group framing and only track the first detected person:
-- Set `GROUP_FRAMING = False` in `config.py`
+| Setting | Effect |
+|---------|--------|
+| `SHOT_TYPE` | Default shot: `full_body`, `waist_up`, `medium`, `close_up` |
+| `MAX_ZOOM` | How tight the camera is allowed to go |
+| `SMOOTHING` | 0 = responsive, 1 = very smooth/slow |
+| `DEADZONE` | How far the subject can drift before the camera pans |
+| `PRIMARY_DWELL_SECONDS` | Minimum time on a subject before a hand-off |
+| `DETECTION_INTERVAL` / `DETECTION_SCALE` | Trade detection accuracy for speed |
+| `CAPTURE_WIDTH` / `CAPTURE_HEIGHT` | Ask the camera for a specific mode (0 = its default) |
 
 ## Troubleshooting
 
-### Camera not found
-```bash
-./run.sh --list-cameras
-# Use found camera index:
-./run.sh --camera 1
-```
-
-### Poor detection (low light)
-→ Increase lighting or adjust `CONFIDENCE_THRESHOLD` in config.py
-
-### Choppy output
-→ Increase `SMOOTHING_FACTOR` in config.py (try 0.25-0.35)
-
-### Tight framing
-→ Change `SHOT_TYPE` in config.py to 'full_body' or 'waist_up', or decrease `MAX_ZOOM`
-
-## System Information
-
-- **Python Version**: 3.13.3
-- **Virtual Environment**: `.venv`
-- **Packages Installed**:
-  - OpenCV 4.13.0
-  - MediaPipe (latest)
-  - NumPy 2.4.4
-
-## Next Steps
-
-1. **Test it**: Run `./run.sh` to see it in action
-2. **Adjust settings**: Edit `config.py` to fine-tune framing
-3. **Record videos**: Use `--output video.mp4` to save
-4. **Explore code**: Check individual modules:
-   - `pose_detector.py` - ML Kit pose detection
-   - `framing_engine.py` - Intelligent crop logic
-   - `smoothing.py` - Camera movement smoothing
-   - `config.py` - All tunable parameters
-
-## Need Help?
-
-- Check README.md for detailed documentation
-- Review config.py comments for detailed options
-- Check individual .py files for function documentation
-
-Happy filming! 🎥
+- **No cameras found** → System Settings → Privacy & Security → Camera: allow Terminal / Autofollow.
+- **"No signal from camera — reconnecting…"** → the device dropped out; it reconnects on its own once it's back.
+- **Choppy** → raise `DETECTION_INTERVAL` to 3, or lower `DETECTION_SCALE` to 0.4.
+- **Too tight / too loose** → change Shot Type, or adjust `MAX_ZOOM`.
+- **Dock app won't open** → re-run `./setup.sh`.

@@ -31,6 +31,18 @@ source "$VENV_DIR/bin/activate"
 # Upgrade pip quietly
 pip install --upgrade pip --quiet
 
+# The opencv-python, opencv-contrib-python and *-headless wheels all install
+# the same 'cv2' package on top of each other.  Having more than one present
+# produces a mixed install that can crash at import or misbehave at runtime,
+# so keep exactly one (opencv-python).
+extras=$(pip list --format=freeze 2>/dev/null | grep -iE '^opencv-(contrib-python|python-headless|contrib-python-headless)==' | cut -d= -f1 || true)
+if [ -n "$extras" ]; then
+    echo "Removing conflicting OpenCV packages: $extras"
+    # shellcheck disable=SC2086
+    pip uninstall -y $extras --quiet
+    pip install --force-reinstall --no-deps "opencv-python>=4.10,<5" --quiet
+fi
+
 # Install dependencies only if any are missing
 echo "Checking dependencies..."
 if ! pip install -r "$SCRIPT_DIR/requirements.txt" --quiet; then
@@ -38,6 +50,11 @@ if ! pip install -r "$SCRIPT_DIR/requirements.txt" --quiet; then
     exit 1
 fi
 
+# Rebuild the Dock launcher's signature so macOS accepts the bundle
+if [ -d "$SCRIPT_DIR/Autofollow.app" ] && command -v codesign &>/dev/null; then
+    codesign --force --deep --sign - "$SCRIPT_DIR/Autofollow.app" 2>/dev/null || true
+fi
+
 echo ""
 echo "=== Setup complete! ==="
-echo "Run the app with:  ./run.sh"
+echo "Run the app with:  ./run.sh   (or open Autofollow.app)"

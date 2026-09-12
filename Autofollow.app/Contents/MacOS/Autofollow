@@ -5,20 +5,33 @@
 
 MACOS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_DIR="$( cd "$MACOS_DIR/../../.." && pwd )"
-
-PYTHON="/opt/homebrew/Cellar/python@3.13/3.13.3/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
-SITE="$PROJECT_DIR/.venv/lib/python3.13/site-packages"
+VENV="$PROJECT_DIR/.venv"
 MAIN="$PROJECT_DIR/main.py"
 
-if [ ! -f "$PYTHON" ]; then
-    osascript -e "display alert \"Autofollow\" message \"Python 3.13 not found.\n\nExpected:\n$PYTHON\n\nRe-run setup.sh then rebuild the app bundle.\" as critical"
+fail() {
+    osascript -e "display alert \"Autofollow\" message \"$1\" as critical"
     exit 1
-fi
+}
 
-if [ ! -f "$MAIN" ]; then
-    osascript -e "display alert \"Autofollow\" message \"Could not find main.py at:\n$MAIN\" as critical"
-    exit 1
-fi
+[ -f "$MAIN" ] || fail "Could not find main.py at:\n$MAIN"
+[ -d "$VENV" ] || fail "Virtual environment not found at:\n$VENV\n\nRun setup.sh first."
+
+# Resolve the interpreter the venv was built with.  pyvenv.cfg's 'home' is a
+# stable path (e.g. /opt/homebrew/opt/python@3.13/bin) that survives Homebrew
+# point-release upgrades, unlike a hard-coded Cellar path.
+PY_HOME="$(sed -n 's/^home *= *//p' "$VENV/pyvenv.cfg" | head -n1)"
+PY_VER="$(sed -n 's/^version *= *\([0-9]*\.[0-9]*\).*/\1/p' "$VENV/pyvenv.cfg" | head -n1)"
+PYTHON=""
+for cand in "$PY_HOME/python$PY_VER" "$PY_HOME/python3" "$(readlink -f "$VENV/bin/python" 2>/dev/null)"; do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then
+        PYTHON="$cand"
+        break
+    fi
+done
+[ -n "$PYTHON" ] || fail "Python $PY_VER not found for the virtual environment.\n\nRe-run setup.sh."
+
+SITE="$(ls -d "$VENV"/lib/python3.*/site-packages 2>/dev/null | head -n1)"
+[ -n "$SITE" ] || fail "No site-packages found in:\n$VENV/lib\n\nRe-run setup.sh."
 
 cd "$PROJECT_DIR"
 

@@ -1,239 +1,144 @@
-# Autofollow: Intelligent Video Framing App
+# Autofollow: Intelligent Virtual PTZ Camera
 
-A macOS application that intelligently crops video from a camera device using AI-powered pose detection. Automatically frames a person in a 16:9 medium close-up shot with smooth camera movements.
+A macOS application that turns a fixed wide camera into a virtual PTZ camera. It detects people with YOLOv8-Pose, picks a subject, and crops a smooth 16:9 shot that follows them — with a control panel for live operation, a fullscreen program output for a second display, and a diagnostics window that shows what the tracker is thinking.
 
 ## Features
 
-- **Real-time pose detection** using MediaPipe (Google's ML Kit equivalent)
-- **4K video support** (up to 4K resolution input)
-- **Intelligent framing** that automatically crops to 16:9 with optimal zoom
-- **Multi-person framing** automatically frames multiple people together with centered panning
-- **Smooth camera movements** using exponential smoothing to eliminate jitter
-- **Live preview** with pose detection visualization
-- **Video output** export to MP4 file format
-- **Multi-camera support** for different camera devices
+- **Real-time pose detection** with YOLOv8-Pose (GPU-accelerated via Apple Metal when available)
+- **Primary Focus mode** — follows the closest person, hands off to someone closer or more active, and re-acquires automatically when the subject leaves
+- **Virtual switcher** — rotates between people on a timer, or on demand with per-person buttons
+- **Cut or crossfade** transitions, with a pre-travel phase so the camera is already settled on the new subject
+- **Shot types** — Full Body, Waist Up, Medium, Close-Up — computed from actual body landmarks
+- **Smooth camera movement** — deadzone, eased panning, heavily damped tilt and zoom
+- **Audience exclusion zone** to ignore people standing in front of the stage
+- **Fullscreen output** on any connected display; settings remembered between launches
+- **Diagnostics window** with color-coded skeleton preview, per-person scores, and a switch-event log
+- **Headless CLI mode** for recording to MP4 without the GUI
 
 ## Requirements
 
-- macOS 10.14+
-- Python 3.10+
-- Webcam or video capture device
+- macOS 12+
+- Python 3.10+ (Homebrew's `python@3.13` is what the Dock launcher expects)
+- Webcam, capture card, or other camera visible to macOS
 
 ## Installation
-
-### 1. Install Python 3.10+
-
-If you don't have Python installed, download from [python.org](https://www.python.org/downloads/)
-
-### 2. One-Click Setup
-
-Run the setup script once. It creates the virtual environment and installs all dependencies automatically — safe to re-run, it skips steps that are already done.
 
 ```bash
 ./setup.sh
 ```
 
-That's it. After setup completes, use `./run.sh` to launch the app.
+This creates the `.venv` virtual environment, installs dependencies, removes any conflicting OpenCV builds, and re-signs `Autofollow.app`. It's safe to re-run.
 
 ## Usage
 
-### Quick Start
+### Launch the control panel
 
 ```bash
 ./run.sh
 ```
 
-Or with options:
+or double-click `Autofollow.app` (it uses the same `.venv`).
+
+The panel shows up immediately; the pose model loads in the background and the status bar reads *Loading pose model…* until it's ready.
+
+### Control panel
+
+| Section | What it does |
+|---------|--------------|
+| **Camera** | Choose the input device. *Refresh* rescans without interrupting the live camera. |
+| **Shot Type** | Full Body / Waist Up / Medium / Close-Up. |
+| **Mode** | *Disabled* shows the whole frame. *Primary* follows the closest person. *Time* rotates between people every N seconds. *Manual* switches only when you press a person button. |
+| **Transition** | Cut or Crossfade, with fade duration. Used for every subject change, including Primary hand-offs. |
+| **Display / Fullscreen** | Pick a display and open the program output fullscreen there. Esc, Q, or a double-click on the output closes it. |
+| **Audience Exclusion** | Ignore anyone whose torso is in the bottom N% of the frame. The zone is drawn in yellow in Diagnostics. |
+| **Max Tracked Persons** | Cap on simultaneously tracked people. |
+
+All of these are saved and restored on the next launch.
+
+### Diagnostics
+
+*Open Diagnostics* shows the raw camera view with skeletons, bounding boxes, the primary indicator and the exclusion zone; a per-person table of the scores that drive switching; and a log of every switch and why it happened. The overlay is only rendered while the window is open, so leaving it closed costs nothing.
+
+### Headless / recording
+
 ```bash
-./run.sh --output video.mp4
+./run.sh --headless --output show.mp4
+./run.sh --headless --camera 1 --shot-type full_body --no-preview --max-frames 3000
 ./run.sh --list-cameras
-```
-
-### Alternative: Manual Activation
-
-If you prefer to activate the virtual environment manually:
-
-```bash
-cd /Users/techbooth/Documents/Autofollow
-source .venv/bin/activate
-python main.py
-```
-
-### Live Preview (Default)
-
-```bash
-./run.sh
-```
-
-Press `q` to quit the preview window.
-
-### List Available Cameras
-
-```bash
-./run.sh --list-cameras
-```
-
-### Use Specific Camera
-
-```bash
-./run.sh --camera 1
-```
-
-### Save Output to File
-
-```bash
-./run.sh --output output.mp4
-```
-
-### Full Example with Options
-
-```bash
-./run.sh --camera 0 --output cropped_video.mp4 --max-frames 1000
-```
-
-## Command Line Options
-
-```
---camera DEVICE_ID       Camera device index (default: 0)
---list-cameras          List available camera devices  
---output FILE           Save output to MP4 file
---max-frames N          Limit frames processed to N
---no-preview            Disable live preview
---help                  Show this help message
 ```
 
 ## How It Works
 
-### 1. **Pose Detection**
-   - Uses MediaPipe to detect human pose landmarks (33 key points)
-   - Identifies the person's position and scale in the frame
-   - Gracefully handles frames where no person is detected
-
-### 2. **Intelligent Framing**
-   - Calculates optimal crop region centered on detected person
-   - Maintains 16:9 aspect ratio for standard video format
-   - Applies 1.5x zoom for a medium close-up shot
-   - Adds 15% padding around person for comfortable framing
-
-### 3. **Smooth Movement**
-   - Applies exponential smoothing to camera position and zoom
-   - Prevents jittery movements frame-to-frame
-   - Limits pan speed (max 100 pixels/frame) and zoom speed
-   - Creates cinematic, professional-grade camera movements
-
-### 4. **Output**
-   - Crops and resizes to 1920x1080 (16:9 1080p)
-   - Supports live preview with visualization
-   - Optionally saves to MP4 file
+1. **Detect** — YOLOv8-Pose runs every `DETECTION_INTERVAL` frames on a downscaled copy of the input and returns 17 COCO keypoints per person. People with no visible hips (typically foreground audience cut off at the waist) are ignored.
+2. **Track** — Detections are matched to existing tracks by IoU, with a center-distance fallback for fast movers, giving each person a stable ID. Tracks expire after `TRACK_DROPOUT_SECONDS` unseen. Each track carries an EMA-smoothed *foreground score* (bbox area) and *activity score* (torso movement).
+3. **Frame** — For the chosen shot type, the zoom is computed from the head and the shot's bottom landmark (hips, knees, ankles…) so the framing is consistent regardless of how far away the person is. Zoom is bounded between "the whole camera frame" and `MAX_ZOOM`.
+4. **Smooth** — A per-subject PTZ smoother applies a horizontal deadzone, quadratic ease-out panning, and slow tilt/zoom, all capped by `MAX_*_SPEED`.
+5. **Switch** — In Primary mode a hand-off needs the candidate to be ≥1.5× larger or ≥2× more active, and only after `PRIMARY_DWELL_SECONDS`. If the subject disappears, the camera holds and slowly widens; after `PRIMARY_REACQUIRE_DELAY` the best remaining person is adopted with the configured transition.
 
 ## Configuration
 
-Edit `config.py` to customize behavior:
+`config.py` holds the startup defaults. The most useful knobs:
 
 ```python
-# Video settings
-VIDEO_WIDTH = 2560          # Input width (supports 4K)
-OUTPUT_WIDTH = 1920         # Output width (16:9)
-OUTPUT_HEIGHT = 1080
+OUTPUT_WIDTH, OUTPUT_HEIGHT = 1280, 720   # program output size
+CAPTURE_WIDTH, CAPTURE_HEIGHT = 0, 0      # requested camera mode (0 = camera default)
 
-# Framing settings
-SHOT_TYPE = 'medium'        # Shot type: 'full_body', 'waist_up', 'medium', 'close_up'
-MAX_ZOOM = 2.5              # Maximum zoom factor (prevents over-zooming)
-PADDING_RATIO = 0.15        # 15% padding around person
+CONFIDENCE_THRESHOLD = 0.7   # keypoint / person confidence
+DETECTION_SCALE = 0.5        # run YOLO on this fraction of the input resolution
+DETECTION_INTERVAL = 2       # detect every N frames
 
-# Smoothing settings
-SMOOTHING_FACTOR = 0.15     # Lower = more smoothing
-MAX_PAN_SPEED = 100         # Pixels per frame
-MAX_ZOOM_SPEED = 0.05       # Scale units per frame
+SHOT_TYPE = 'waist_up'
+MAX_ZOOM = 4.0               # relative to the output size
+DEADZONE = 0.4               # fraction of the viewport the subject can roam without panning
+SMOOTHING = 0.5              # 0 = responsive … 1 = very smooth
+MAX_PAN_SPEED = 15           # source px / frame
+MAX_TILT_SPEED = 3
+MAX_ZOOM_SPEED = 0.015
+
+PRIMARY_DWELL_SECONDS = 3.0
+PRIMARY_REACQUIRE_DELAY = 1.0
+TRACK_DROPOUT_SECONDS = 2.0
 ```
 
 ## Performance Notes
 
-- **Real-time processing**: Typically 25-30 FPS on modern Macs
-- **GPU acceleration**: Uses CPU; can be optimized with CoreML
-- **Memory usage**: ~200-300 MB typical
-- **Frame skipping**: Set `SKIP_FRAMES` in config.py to process fewer frames if needed
+- On Apple Silicon the model runs on Metal (`mps`); a 1080p camera processes at 30+ fps with detection every other frame.
+- Lower `DETECTION_SCALE` or raise `DETECTION_INTERVAL` for more headroom on slower machines; raise `DETECTION_SCALE` toward 1.0 if small, distant people are missed.
+- Output frames are dropped rather than queued if the UI falls behind, so latency stays bounded.
 
 ## Troubleshooting
 
-### Camera not found
-```bash
-python main.py --list-cameras
-# Use camera number in output:
-python main.py --camera 1
-```
+**No cameras found / "Could not open camera"** — check that Terminal (or the app) has Camera permission in System Settings → Privacy & Security → Camera. Use `./run.sh --list-cameras` to see what macOS exposes.
 
-### Poor pose detection
-- Ensure good lighting
-- Position subject with clear view of body
-- Adjust `CONFIDENCE_THRESHOLD` in `config.py` (lower = more sensitive)
+**"No signal from camera — reconnecting…"** — the device stopped delivering frames (unplugged, or grabbed by another app). Autofollow retries every few seconds and resumes automatically.
 
-### Choppy output
-- Reduce input resolution
-- Increase `SMOOTHING_FACTOR` in `config.py`
-- Increase `MAX_PAN_SPEED` for faster response
+**People aren't detected** — improve lighting, or lower `CONFIDENCE_THRESHOLD`. Make sure the Audience Exclusion slider isn't hiding them (check the yellow zone in Diagnostics).
 
-### Output file issues
-- Ensure output directory exists and is writable
-- Use absolute path: `/Users/username/Desktop/video.mp4`
+**The shot ping-pongs between two people** — raise `PRIMARY_DWELL_SECONDS`, or use Manual mode.
+
+**Dock app won't launch** — run `./setup.sh` again; it rebuilds the environment and re-signs the bundle.
 
 ## Project Structure
 
 ```
 Autofollow/
-├── setup.sh               # One-click setup (venv + dependencies)
+├── setup.sh               # One-click setup (venv + dependencies + re-sign app)
 ├── run.sh                 # Launch the app
-├── main.py                # Entry point and CLI
-├── video_processor.py     # Main processing pipeline
-├── pose_detector.py       # Pose detection (MediaPipe)
-├── framing_engine.py      # Crop calculation and framing logic
-├── smoothing.py           # Camera movement smoothing
-├── config.py              # Configuration settings
-├── requirements.txt       # Python dependencies
-└── README.md             # This file
+├── main.py                # Entry point: GUI (default), --headless, --list-cameras
+├── control_ui.py          # PyQt5 control panel, video thread, output + diagnostics windows
+├── video_processor.py     # Headless processing pipeline
+├── camera.py              # Camera discovery / opening
+├── pose_detector.py       # YOLOv8-Pose wrapper
+├── tracker.py             # Multi-person tracking with stable IDs
+├── framing_engine.py      # Shot-type framing and crop
+├── smoothing.py           # PTZ smoothing / deadzone
+├── switcher.py            # Virtual switcher state machine
+├── config.py              # Defaults
+├── make_icon.py           # Generates AppIcon.icns for the bundle
+├── Autofollow.app/        # Dock launcher (uses .venv)
+└── yolov8n-pose.pt        # Model weights
 ```
-
-## Advanced Features
-
-### Custom Camera Settings
-
-Modify the camera initialization in `VideoProcessor.initialize_camera()`:
-
-```python
-# Set custom resolution
-self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)  # 4K width
-self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160) # 4K height
-self.cap.set(cv2.CAP_PROP_FPS, 30)
-```
-
-### Real-time Parameter Tuning
-
-Edit config values while running to experiment:
-- Use `--shot-type close_up` for tighter framing, or increase `MAX_ZOOM` in config.py
-- Decrease `SMOOTHING_FACTOR` for smoother but slower response
-- Adjust `PADDING_RATIO` for more/less head space
-
-## Limitations
-
-- Requires front-facing camera position
-- Works best with single person in frame
-- Pose detection confidence varies with lighting and body position
-- Video output limited to approximately 1080p resolution
-
-## Future Enhancements
-
-- [ ] Multi-person tracking with person selection
-- [ ] GPU acceleration with CoreML
-- [ ] Face detection for better head positioning  
-- [ ] Custom framing presets (tight close-up, medium shot, wide shot)
-- [ ] Real-time parameter UI
-- [ ] Scene detection and adaptive framing
-- [ ] 4K output support
 
 ## License
 
 MIT License - Feel free to use and modify
-
-## Support
-
-For issues or questions, check the troubleshooting section or review config.py settings.
