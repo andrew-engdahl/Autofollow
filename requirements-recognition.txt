@@ -1,0 +1,12 @@
+# Optional — face recognition, speaker recognition and music detection.
+# Installed by:  ./setup.sh --with-recognition
+# These are large (TensorFlow alone is ~500 MB) and some build native
+# extensions; the core app runs fully without them, with the People /
+# Audio features reporting "unavailable".
+insightface>=0.7.3
+onnxruntime>=1.17.0
+webrtcvad-wheels>=2.0.10
+speechbrain>=0.5.16
+soundfile>=0.12.0
+tensorflow>=2.16.0
+tensorflow-hub>=0.16.0

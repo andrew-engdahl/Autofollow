@@ -5,6 +5,16 @@ set -e
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 VENV_DIR="$SCRIPT_DIR/.venv"
 PYTHON="python3"
+WITH_RECOGNITION=0
+for arg in "$@"; do
+    case "$arg" in
+        --with-recognition) WITH_RECOGNITION=1 ;;
+        -h|--help)
+            echo "Usage: ./setup.sh [--with-recognition]"
+            echo "  --with-recognition   also install face/speaker/music recognition (large)"
+            exit 0 ;;
+    esac
+done
 
 echo "=== Autofollow Setup ==="
 
@@ -50,6 +60,15 @@ if ! pip install -r "$SCRIPT_DIR/requirements.txt" --quiet; then
     exit 1
 fi
 
+# Optional recognition stack — never fatal for the core app.
+if [ "$WITH_RECOGNITION" = "1" ]; then
+    echo "Installing recognition extras (this downloads several hundred MB)..."
+    if ! pip install -r "$SCRIPT_DIR/requirements-recognition.txt" --quiet; then
+        echo "WARNING: Recognition extras failed to install. The core app still works;"
+        echo "         face/speaker/music features will show as unavailable."
+    fi
+fi
+
 # Rebuild the Dock launcher's signature so macOS accepts the bundle
 if [ -d "$SCRIPT_DIR/Autofollow.app" ] && command -v codesign &>/dev/null; then
     codesign --force --deep --sign - "$SCRIPT_DIR/Autofollow.app" 2>/dev/null || true
@@ -58,3 +77,6 @@ fi
 echo ""
 echo "=== Setup complete! ==="
 echo "Run the app with:  ./run.sh   (or open Autofollow.app)"
+if [ "$WITH_RECOGNITION" != "1" ]; then
+    echo "For face/speaker/music recognition:  ./setup.sh --with-recognition"
+fi

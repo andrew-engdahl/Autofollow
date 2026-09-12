@@ -4,7 +4,8 @@
 
 ```bash
 cd /Users/techbooth/Documents/Autofollow
-./setup.sh
+./setup.sh                      # core app
+./setup.sh --with-recognition   # optional: face / speaker / music recognition (big download)
 ```
 
 ## Every time
@@ -28,6 +29,7 @@ The control panel appears right away; wait for the status bar to change from *Lo
    - **Disabled** — full wide shot, no tracking.
 4. **Shot Type** and **Transition** can be changed live.
 5. If people in the front row keep getting picked up, raise **Audience Exclusion** until they fall inside the yellow zone in **Diagnostics**.
+6. *(Optional, needs `--with-recognition`)* **Manage People** to enroll the pastor / worship leader by photo and voice with a priority; tick **Audio → Enabled** to use speaker recognition and music detection live.
 
 Everything you set is remembered for next time.
 

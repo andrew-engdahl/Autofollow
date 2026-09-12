@@ -18,6 +18,25 @@ _CENTER_DIST_FALLBACK = 0.25   # fraction of frame diagonal — generous to hand
 
 _FG_SCORE_EMA_ALPHA = 0.15   # heavy smoothing on bbox-area score to prevent fg_ratio oscillation
 
+# A face match is forgotten if it hasn't been re-confirmed within this long.
+# Recognition runs asynchronously at a few Hz, so a 5 s hold rides out the
+# occasional missed detection (head turned, brief occlusion) without letting a
+# stale identity stick to a track after a hand-off.
+FACE_MATCH_STALE_SECONDS = 5.0
+
+
+def priority_weight(priority: int) -> float:
+    """Score multiplier from a profile's priority (0–10).
+
+    priority  0 -> 1.0  (no boost — same as an unmatched person)
+    priority  5 -> 2.0
+    priority 10 -> 3.0
+
+    Used to bias candidate selection toward higher-priority profiles in both
+    primary-focus and time-switcher modes.
+    """
+    return 1.0 + max(0, min(10, int(priority))) / 5.0
+
 
 @dataclass
 class TrackedPerson:
@@ -29,6 +48,26 @@ class TrackedPerson:
     activity_score: float = 0.0      # EMA-smoothed weighted center displacement
     frames_unseen: int = 0           # consecutive detector passes without a match
     last_seen: float = 0.0           # time.monotonic() of the last matched detection
+    # Face-recognition match (populated by FaceRecognizer via PersonTracker.set_profile_match)
+    profile_id: str | None = None    # ID of matched People profile, if any
+    profile_name: str | None = None  # display name of matched profile
+    profile_priority: int = 0        # 0–10 priority of matched profile
+    profile_score: float = 0.0       # cosine similarity at last match
+    face_seen_at: float = 0.0        # time.monotonic() of the last confirmed face match
+
+    # Transient voice priority boost — applied when speaker recognition matches
+    # this person's profile. Decays back to 0 after a few seconds of silence.
+    voice_boost: float = 0.0         # 0.0 – 5.0 priority units; added to profile_priority
+    voice_boost_expires_at: float = 0.0  # time.monotonic() expiry for the boost
+
+    @property
+    def effective_priority(self) -> float:
+        """Profile priority plus any active voice boost.
+
+        Clamped to ≤15 so a recognized speaker with priority 10 caps at 15
+        (instead of unbounded growth as boosts overlap).
+        """
+        return min(15.0, float(self.profile_priority) + float(self.voice_boost))
 
 
 def _iou(a, b):
@@ -222,6 +261,94 @@ class PersonTracker:
                 used_tracks.add(best_id)
 
         return det_to_track
+
+    # ------------------------------------------------------------------
+    # Face-recognition match plumbing
+    # ------------------------------------------------------------------
+
+    def set_profile_match(self, person_id: str, profile_id: str | None,
+                          profile_name: str | None, priority: int,
+                          score: float):
+        """Attach (or clear) a face-recognition match to a tracked person.
+
+        A profile can only belong to one track at a time: if it was previously
+        attached to a different track (e.g. an ID swap after occlusion), that
+        track is cleared so priority doesn't get counted twice.
+        """
+        track = self._tracks.get(person_id)
+        if track is None:
+            return
+        if profile_id is not None:
+            for other in self._tracks.values():
+                if other is not track and other.profile_id == profile_id:
+                    self._clear_profile(other)
+        track.profile_id = profile_id
+        track.profile_name = profile_name
+        track.profile_priority = int(priority)
+        track.profile_score = float(score)
+        track.face_seen_at = time.monotonic()
+
+    @staticmethod
+    def _clear_profile(track: TrackedPerson):
+        track.profile_id = None
+        track.profile_name = None
+        track.profile_priority = 0
+        track.profile_score = 0.0
+        track.voice_boost = 0.0
+        track.voice_boost_expires_at = 0.0
+
+    def apply_voice_boost(self, profile_id: str, boost: float, hold_seconds: float) -> int:
+        """Raise voice_boost on every tracked person matched to ``profile_id``.
+
+        Called when the SpeakerRecognizer matches an enrolled voice. Returns
+        the number of tracks that received the boost (0 if no tracked person
+        is currently matched to that profile — e.g. the speaker isn't on
+        camera, only their voice is on the mic).
+        """
+        expiry = time.monotonic() + hold_seconds
+        boosted = 0
+        for t in self._tracks.values():
+            if t.profile_id == profile_id:
+                t.voice_boost = max(t.voice_boost, float(boost))
+                t.voice_boost_expires_at = max(t.voice_boost_expires_at, expiry)
+                boosted += 1
+        return boosted
+
+    def expire_transients(self):
+        """Drop expired voice boosts and stale face matches. Call once per frame."""
+        now = time.monotonic()
+        for t in self._tracks.values():
+            if t.voice_boost > 0.0 and now >= t.voice_boost_expires_at:
+                t.voice_boost = 0.0
+                t.voice_boost_expires_at = 0.0
+            if (t.profile_id is not None
+                    and now - t.face_seen_at > FACE_MATCH_STALE_SECONDS):
+                self._clear_profile(t)
+
+    @staticmethod
+    def match_face_to_bbox(face_bbox: tuple[int, int, int, int],
+                           bodies: list[tuple[str, tuple]]) -> str | None:
+        """Pick the body bbox that contains the given face bbox.
+
+        ``bodies`` is a list of (track_id, (x1, y1, x2, y2)) — a snapshot taken
+        when the frame was handed to the recognizer, so this stays correct even
+        though recognition finishes some time later.  The face center must lie
+        inside the body bbox and in its upper 60% (faces are above the waist).
+        Ties go to the smaller body bbox (nearer person occluding background).
+        """
+        fx1, fy1, fx2, fy2 = face_bbox
+        fcx = (fx1 + fx2) / 2.0
+        fcy = (fy1 + fy2) / 2.0
+        best: tuple[float, str] | None = None
+        for tid, (bx1, by1, bx2, by2) in bodies:
+            if not (bx1 <= fcx <= bx2 and by1 <= fcy <= by2):
+                continue
+            if fcy > by1 + (by2 - by1) * 0.6:
+                continue
+            area = max(1.0, (bx2 - bx1) * (by2 - by1))
+            if best is None or area < best[0]:
+                best = (area, tid)
+        return best[1] if best else None
 
     def get_primary(self) -> TrackedPerson | None:
         """Return the most-foreground (largest bbox) tracked person."""

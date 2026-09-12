@@ -21,6 +21,24 @@ from tracker import PersonTracker
 from framing_engine import FramingEngine
 from smoothing import PTZSmoother
 from switcher import VirtualSwitcher, _PRETRAVEL_DURATION
+from profiles import ProfileStore
+from audio_thread import AudioThread, SPEAKER_BOOST_HOLD_S
+from audio_capture import list_input_devices
+from face_worker import FaceRecognitionWorker
+
+
+# Hand a frame to the face-recognition worker at most every N captured frames
+# (~5 Hz at 30 fps).  The worker runs on its own thread and drops the request
+# if it is still busy, so this is a ceiling, not a fixed cost.
+FACE_RECOGNITION_INTERVAL = 6
+
+# Priority units added transiently to a profile whose voice is being recognized.
+# Combined with profile.priority via TrackedPerson.effective_priority.
+VOICE_PRIORITY_BOOST = 5.0
+
+# Primary Focus dwell while music mode is active (performances want snappier
+# hand-offs than a sermon).
+_MUSIC_MODE_DWELL_SECONDS = 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +113,7 @@ class AppState:
         'camera_index', 'tracking_mode', 'shot_type', 'switch_mode',
         'switch_trigger', 'switch_interval', 'crossfade_duration',
         'auto_follow_enabled', 'foreground_exclusion_y', 'max_persons',
-        'diag_overlays', 'display_index',
+        'diag_overlays', 'display_index', 'audio_enabled', 'audio_device_name',
     )
 
     def __init__(self):
@@ -116,6 +134,22 @@ class AppState:
         self.diag_overlays: bool = config.SHOW_DIAGNOSTICS
         self.display_index: int = 0
 
+        # Audio-driven state (written by AudioThread handlers on the UI thread)
+        self.audio_enabled: bool = False                 # user wants audio analysis on
+        self.audio_device_name: str = ''                 # '' = system default
+        self.music_mode: bool = False
+        self.audio_music_score: float = 0.0
+        self.audio_speech_score: float = 0.0
+        # Most-recent recognized speaker (sticky until a different one matches
+        # or the boost window expires; shown in the diagnostics panel).
+        self.audio_speaker_name: str | None = None
+        self.audio_speaker_score: float = 0.0
+        self.audio_speaker_expires_at: float = 0.0
+        # Pending voice boost: (profile_id, boost, hold_seconds). Consumed by
+        # VideoThread next frame so AudioThread → tracker handoff happens on the
+        # right thread.
+        self.pending_voice_boost: tuple | None = None
+
     def read(self):
         """Return a snapshot of current settings (thread-safe)."""
         with QMutexLocker(self._lock):
@@ -132,6 +166,16 @@ class AppState:
                 'max_persons': self.max_persons,
                 'diag_visible': self.diag_visible,
                 'diag_overlays': self.diag_overlays,
+                'music_mode': self.music_mode,
+                'audio_state': {
+                    'enabled': self.audio_enabled,
+                    'music_mode': self.music_mode,
+                    'music_score': self.audio_music_score,
+                    'speech_score': self.audio_speech_score,
+                    'speaker_name': self.audio_speaker_name,
+                    'speaker_score': self.audio_speaker_score,
+                    'speaker_expires_at': self.audio_speaker_expires_at,
+                },
             }
 
     def set(self, **kwargs):
@@ -139,6 +183,12 @@ class AppState:
         with QMutexLocker(self._lock):
             for k, v in kwargs.items():
                 setattr(self, k, v)
+
+    def consume_voice_boost(self) -> tuple | None:
+        with QMutexLocker(self._lock):
+            val = self.pending_voice_boost
+            self.pending_voice_boost = None
+            return val
 
     def consume_manual_switch(self) -> str | None:
         with QMutexLocker(self._lock):
@@ -205,7 +255,8 @@ class VideoThread(QThread):
     status = pyqtSignal(str)                  # human-readable pipeline state / errors
     persons_updated = pyqtSignal(list)        # list of person IDs currently tracked
 
-    def __init__(self, state: AppState, parent=None):
+    def __init__(self, state: AppState, profile_store: ProfileStore | None = None,
+                 parent=None):
         super().__init__(parent)
         self._state = state
         self._running = False
@@ -219,6 +270,20 @@ class VideoThread(QThread):
         self._smoother = PTZSmoother()
         self._switcher = VirtualSwitcher()
         self._frame_count = 0
+
+        # Face recognition runs on its own worker thread (see face_worker.py);
+        # results are polled and applied to the tracker by ID.
+        self._profile_store = profile_store
+        self._face_worker = (FaceRecognitionWorker(profile_store)
+                             if profile_store is not None else None)
+        self._face_error_reported = False
+
+        # Latest raw camera frame — used by the People UI to capture reference
+        # images.  cap.read() hands us a fresh buffer every frame and nothing in
+        # the pipeline writes into it, so holding a reference costs nothing;
+        # grab_latest_frame() copies on demand.
+        self._latest_frame_lock = threading.Lock()
+        self._latest_frame: np.ndarray | None = None
 
         self._person_index_map: dict[str, int] = {}   # stable color index per person ID
         self._next_person_color_idx: int = 0
@@ -297,6 +362,8 @@ class VideoThread(QThread):
                 continue
             last_frame_time = now
             self._frame_times.append(now)
+            with self._latest_frame_lock:
+                self._latest_frame = frame
 
             result = self._process_frame(frame, settings)
             self._frame_count += 1
@@ -316,8 +383,20 @@ class VideoThread(QThread):
         with self._inflight_lock:
             self._frames_in_flight = max(0, self._frames_in_flight - 1)
 
+    def grab_latest_frame(self) -> np.ndarray | None:
+        """Return a copy of the most recent raw camera frame, or None."""
+        with self._latest_frame_lock:
+            return None if self._latest_frame is None else self._latest_frame.copy()
+
+    def reindex_profiles(self):
+        """Tell the face recognizer to rebuild its profile index on next pass."""
+        if self._face_worker is not None:
+            self._face_worker.mark_index_dirty()
+
     def stop(self):
         self._running = False
+        if self._face_worker is not None:
+            self._face_worker.stop()
         # cap.read() can block indefinitely on a stalled device; don't let that
         # hang application shutdown.
         if not self.wait(3000):
@@ -386,7 +465,31 @@ class VideoThread(QThread):
         else:
             persons = self._tracker.get_all()
 
+        # Face recognition: apply results from the last pass, then hand this
+        # frame to the worker if it's idle and there is anything to match.
+        if self._face_worker is not None and persons:
+            for m in self._face_worker.poll() or ():
+                self._tracker.set_profile_match(
+                    m['track_id'], m['profile_id'], m['name'], m['priority'], m['score'])
+            if not self._face_worker.available:
+                if not self._face_error_reported:
+                    self._face_error_reported = True
+                    self.status.emit(self._face_worker.error_message or
+                                     "Face recognition unavailable")
+            elif (self._frame_count % FACE_RECOGNITION_INTERVAL == 0
+                    and not self._face_worker.busy
+                    and self._face_worker.has_profiles()):
+                self._face_worker.submit(frame, [(p.id, p.bbox) for p in persons])
+
+        # Voice boost queued by the AudioThread, then expire boosts / stale faces.
+        voice_boost = self._state.consume_voice_boost()
+        if voice_boost is not None:
+            profile_id, boost, hold = voice_boost
+            self._tracker.apply_voice_boost(profile_id, boost, hold)
+        self._tracker.expire_transients()
+
         # Sync switcher settings from UI state
+        self._switcher.music_mode = bool(settings.get('music_mode', False))
         self._switcher.switch_mode = settings['switch_mode']
         self._switcher.trigger = settings['switch_trigger']
         self._switcher.interval = settings['switch_interval']
@@ -451,8 +554,22 @@ class VideoThread(QThread):
                 'smoother_x': smoother_state.get('x'),
                 'smoother_zoom': smoother_state.get('zoom'),
                 'frames_unseen': p.frames_unseen,
+                'profile_id': p.profile_id,
+                'profile_name': p.profile_name,
+                'profile_priority': p.profile_priority,
+                'profile_score': p.profile_score,
+                'voice_boost': p.voice_boost,
+                'effective_priority': p.effective_priority,
             })
 
+        # Audio snapshot for the diagnostics panel; expire the sticky speaker
+        # name once its hold window passes so the panel doesn't lie.
+        audio_state = dict(settings.get('audio_state') or {})
+        if time.monotonic() >= audio_state.get('speaker_expires_at', 0.0):
+            audio_state['speaker_name'] = None
+            audio_state['speaker_score'] = 0.0
+
+        music_mode = bool(settings.get('music_mode', False))
         meta = {
             'fps': self._measured_fps(),
             'n_persons': len(persons),
@@ -462,11 +579,14 @@ class VideoThread(QThread):
             'pending_id': self._primary_pending_id,
             'pretraveling': self._primary_pretraveling,
             'dwell_elapsed': time.monotonic() - self._primary_last_switch_time,
-            'dwell_threshold': config.PRIMARY_DWELL_SECONDS,
+            'dwell_threshold': self._primary_dwell(music_mode),
             'mode': mode,
             'smoother_primary': self._smoother.get_state('primary'),
             'searching': self._searching,
             'person_index_map': dict(self._person_index_map),
+            'audio_state': audio_state,
+            'face_ms': (self._face_worker.last_duration * 1000.0
+                        if self._face_worker is not None else 0.0),
         }
         return _bgr_to_qimage(output_frame), meta
 
@@ -555,7 +675,14 @@ class VideoThread(QThread):
                 cv2.circle(out, (cx_p, cy_p), 10, color,           2, cv2.LINE_AA)
 
             # ── ID + score label ─────────────────────────────────────────
-            label = f"{'▶ ' if is_primary else ''}{person.id}"
+            # Prefer the matched profile name over the generic personN ID;
+            # ★N shows static priority, ● shows an active voice boost.
+            id_text = person.profile_name or person.id
+            if person.profile_name and person.profile_priority > 0:
+                id_text = f"★{person.profile_priority} {id_text}"
+            if person.voice_boost > 0:
+                id_text = f"● {id_text}"
+            label = f"{'▶ ' if is_primary else ''}{id_text}"
             font = cv2.FONT_HERSHEY_SIMPLEX
             lscale, lthick = 0.5, 1
             (tw, th), _ = cv2.getTextSize(label, font, lscale, lthick)
@@ -644,6 +771,25 @@ class VideoThread(QThread):
     # Primary Focus mode
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _primary_dwell(music_mode: bool) -> float:
+        return _MUSIC_MODE_DWELL_SECONDS if music_mode else config.PRIMARY_DWELL_SECONDS
+
+    @staticmethod
+    def _pick_subject(persons, music_mode: bool):
+        """Best person to adopt when we have no primary.
+
+        Foreground area is the base signal, with a mild bias toward recognized
+        high-priority people (and anyone whose voice is currently recognized).
+        The bias is capped at 1.75× so an obviously closer unmatched person
+        still wins over a low-priority profile at the back.  In music mode the
+        most active performer wins outright.
+        """
+        if music_mode:
+            return max(persons, key=lambda p: (p.activity_score, p.foreground_score))
+        return max(persons,
+                   key=lambda p: p.foreground_score * (1.0 + p.effective_priority / 20.0))
+
     def _clear_primary_transition(self):
         self._primary_pending_id = None
         self._primary_pretraveling = False
@@ -713,6 +859,7 @@ class VideoThread(QThread):
         """
         sw_mode = settings.get('switch_mode', 'crossfade')
         xfade_dur = settings.get('crossfade_duration', 1.0)
+        music_mode = bool(settings.get('music_mode', False))
         now = time.monotonic()
 
         # Start on the wide shot so the first acquisition is a push-in, not a snap.
@@ -727,7 +874,7 @@ class VideoThread(QThread):
             if not self._searching:
                 self._searching = True
                 self._search_start = now
-            candidate = persons[0] if persons else None
+            candidate = self._pick_subject(persons, music_mode) if persons else None
             waited = now - self._search_start
             if candidate is not None and (
                     self._primary_id is None or waited >= config.PRIMARY_REACQUIRE_DELAY):
@@ -740,22 +887,35 @@ class VideoThread(QThread):
 
         # ── Candidate selection (steady state only) ──────────────────────
         # persons[] is sorted foreground_score desc (nearest = persons[0]).
-        # Both scores are EMA-smoothed in the tracker so single-frame noise
-        # can't trigger a switch, and the dwell time prevents ping-ponging.
-        if primary_present and self._primary_pending_id is None and persons:
+        # Raw bbox area decides who is "nearest" — profile priority never
+        # changes the pick, only how reluctant we are to switch, so unmatched
+        # guests stay fully eligible whenever they're clearly closer.  Both
+        # scores are EMA-smoothed in the tracker so single-frame noise can't
+        # trigger a switch, and the dwell time prevents ping-ponging.
+        others = [p for p in persons if p.id != self._primary_id]
+        if (primary_present and self._primary_pending_id is None and others
+                and now - self._primary_last_switch_time >= self._primary_dwell(music_mode)):
             current_p = by_id[self._primary_id]
-            nearest = persons[0]
-            if (nearest.id != self._primary_id
-                    and now - self._primary_last_switch_time >= config.PRIMARY_DWELL_SECONDS):
-                fg_ratio = nearest.foreground_score / max(current_p.foreground_score, 1e-6)
-                cand_act = nearest.activity_score
-                curr_act = current_p.activity_score
-                # Proximity switch: candidate must be substantially closer (50% more area).
-                fg_wins = fg_ratio >= 1.5
-                # Activity switch: candidate must clear a noise floor AND be 2× more active.
-                activity_wins = cand_act >= 5.0 and cand_act > curr_act * 2.0
-                if fg_wins or activity_wins:
-                    self._begin_primary_transition(nearest.id, now)
+            if music_mode:
+                # The most active performer (singing, soloing, leading) is the
+                # right primary during music; fall back to area when nobody moves.
+                nearest = max(others, key=lambda p: (p.activity_score, p.foreground_score))
+            else:
+                nearest = max(others, key=lambda p: p.foreground_score)
+            fg_ratio = nearest.foreground_score / max(current_p.foreground_score, 1e-6)
+            cand_act = nearest.activity_score
+            curr_act = current_p.activity_score
+            # Priority modulates the proximity threshold:
+            #   diff +10 → 1.0 (any closer wins), 0 → 1.5, -10 → 2.25.
+            priority_diff = nearest.effective_priority - current_p.effective_priority
+            switch_threshold = max(1.0, 1.5 - priority_diff * 0.075)
+            fg_wins = fg_ratio >= switch_threshold
+            # Strictly higher-priority candidate who is about as close — switch now.
+            priority_override = priority_diff > 0 and fg_ratio >= 0.9
+            # Activity switch: candidate must clear a noise floor AND be 2× more active.
+            activity_wins = cand_act >= 5.0 and cand_act > curr_act * 2.0
+            if priority_override or fg_wins or activity_wins:
+                self._begin_primary_transition(nearest.id, now)
 
         # ── Transition: pretravel → cut / crossfade ──────────────────────
         if self._primary_pending_id is not None:
@@ -895,14 +1055,25 @@ class DiagnosticsWindow(QMainWindow):
         self._lbl_phase    = self._make_field("Phase", state_grid)
         self._lbl_dwell    = self._make_field("Dwell", state_grid)
         self._lbl_fps      = self._make_field("FPS", state_grid)
+        self._lbl_face_ms  = self._make_field("Face", state_grid)
         layout.addWidget(state_box)
+
+        # ── Audio state row ──────────────────────────────────────────────
+        audio_box = QGroupBox("Audio")
+        audio_grid = QHBoxLayout(audio_box)
+        self._lbl_audio_mode    = self._make_field("Mode", audio_grid)
+        self._lbl_audio_speaker = self._make_field("Speaker", audio_grid)
+        self._lbl_audio_scores  = self._make_field("Music/Speech", audio_grid)
+        layout.addWidget(audio_box)
 
         # ── Per-person table ─────────────────────────────────────────────
         persons_box = QGroupBox("Tracked Persons")
         persons_layout = QVBoxLayout(persons_box)
-        self._table = QTableWidget(0, 9)
+        self._table = QTableWidget(0, 11)
         self._table.setHorizontalHeaderLabels(
-            ["", "ID", "FG(sm)", "Act(sm)", "FG Ratio", "Act Ratio", "Unseen", "Center X,Y", "Zoom(sm)"]
+            ["", "ID / Profile", "Face", "Voice",
+             "FG(sm)", "Act(sm)", "FG Ratio", "Act Ratio",
+             "Unseen", "Center X,Y", "Zoom(sm)"]
         )
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -995,8 +1166,32 @@ class DiagnosticsWindow(QMainWindow):
             self._lbl_active.setText(primary_id or '—')
             self._lbl_pending.setText(pending_id or '—')
             self._lbl_phase.setText(phase)
-            self._lbl_dwell.setText(f"{dwell:.2f}/{dwell_threshold:.0f}s")
+            self._lbl_dwell.setText(f"{dwell:.2f}/{dwell_threshold:.1f}s")
             self._lbl_fps.setText(f"{fps:.1f}")
+            face_ms = meta.get('face_ms', 0.0)
+            self._lbl_face_ms.setText(f"{face_ms:.0f} ms" if face_ms > 0 else "—")
+
+            audio_state = meta.get('audio_state') or {}
+            if audio_state.get('enabled'):
+                music_on = bool(audio_state.get('music_mode'))
+                self._lbl_audio_mode.setText("MUSIC" if music_on else "Speech")
+                self._lbl_audio_mode.setStyleSheet(
+                    "color: #c678dd; font-weight: bold;" if music_on
+                    else "color: #98c379; font-weight: bold;")
+            else:
+                self._lbl_audio_mode.setText("off")
+                self._lbl_audio_mode.setStyleSheet("color: gray;")
+            spk_name = audio_state.get('speaker_name')
+            if spk_name:
+                self._lbl_audio_speaker.setText(
+                    f"● {spk_name} ({audio_state.get('speaker_score', 0.0):.2f})")
+                self._lbl_audio_speaker.setStyleSheet("color: #61afef; font-weight: bold;")
+            else:
+                self._lbl_audio_speaker.setText("—")
+                self._lbl_audio_speaker.setStyleSheet("color: gray;")
+            self._lbl_audio_scores.setText(
+                f"m={audio_state.get('music_score', 0.0):.2f} / "
+                f"s={audio_state.get('speech_score', 0.0):.2f}")
 
             # Red = gate closed (can't switch yet), green = gate open
             if not gate_open:
@@ -1078,8 +1273,25 @@ class DiagnosticsWindow(QMainWindow):
             swatch.setTextAlignment(Qt.AlignCenter)
             self._table.setItem(row, 0, swatch)
 
+            # Face column: profile name + cosine score; voice column: active boost
+            profile_name = p.get('profile_name')
+            profile_priority = p.get('profile_priority', 0)
+            if profile_name:
+                face_cell = f"{profile_name} ★{profile_priority} ({p.get('profile_score', 0.0):.2f})"
+                id_cell = f"{pid} → {profile_name}"
+            else:
+                face_cell = "—"
+                id_cell = pid
+            voice_boost = p.get('voice_boost', 0.0)
+            if voice_boost > 0:
+                voice_cell = f"● +{voice_boost:.0f} (eff {p.get('effective_priority', profile_priority):.0f})"
+            else:
+                voice_cell = "—"
+
             cells = [
-                pid,
+                id_cell,
+                face_cell,
+                voice_cell,
                 f"{fg:.4f}",
                 f"{act:.2f}",
                 f"{'!' if fg_trigger  else ''}{fg_ratio:.2f}",
@@ -1177,18 +1389,30 @@ class ControlWindow(QMainWindow):
         self._state = AppState()
         self._state.load(self._settings)
 
+        self._profile_store = ProfileStore()
+        self._people_win = None  # lazy-created when user opens "Manage People"
+
         self._output_win = OutputWindow()
         self._output_win.visibility_changed.connect(self._on_output_visibility)
         self._diag_win = DiagnosticsWindow(show_overlays=self._state.diag_overlays)
         self._diag_win.overlays_changed.connect(self._on_diagnostics_changed)
         self._diag_win.visibility_changed.connect(self._on_diag_visibility)
 
-        self._video_thread = VideoThread(self._state)
+        self._video_thread = VideoThread(self._state, profile_store=self._profile_store)
         self._video_thread.frame_ready.connect(self._on_frame)
         self._video_thread.diag_frame_ready.connect(self._diag_win.update_video)
         self._video_thread.camera_info.connect(self._on_camera_info)
         self._video_thread.status.connect(self._on_status)
         self._video_thread.persons_updated.connect(self._on_persons_updated)
+
+        # Audio analysis (capture + VAD + speaker recognition + music classification).
+        # Starts idle; capture only begins when the user enables it.
+        self._audio_thread = AudioThread(self._profile_store)
+        self._audio_thread.audio_state_changed.connect(self._on_audio_state_changed)
+        self._audio_thread.speaker_detected.connect(self._on_speaker_detected)
+        self._audio_thread.error.connect(self._on_audio_error)
+        self._audio_thread.status.connect(self._on_status)
+        self._audio_status_text = "Audio: off"
 
         self._preview_label = QLabel()
         self._preview_label.setAlignment(Qt.AlignCenter)
@@ -1198,6 +1422,9 @@ class ControlWindow(QMainWindow):
         self._last_status: str = ""
         self._build_ui()
         self._video_thread.start()
+        self._audio_thread.start()
+        if self._state.audio_enabled:
+            self._apply_audio_settings(enable=True)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1210,6 +1437,7 @@ class ControlWindow(QMainWindow):
         layout.setSpacing(8)
 
         layout.addWidget(self._build_camera_section())
+        layout.addWidget(self._build_audio_section())
         layout.addWidget(self._build_shot_section())
         layout.addWidget(self._build_switcher_section())
         layout.addWidget(self._preview_label)
@@ -1255,6 +1483,77 @@ class ControlWindow(QMainWindow):
                 self._cam_combo.setCurrentIndex(i)
                 break
         self._cam_combo.blockSignals(False)
+
+    # --- Audio ---
+
+    def _build_audio_section(self):
+        """Audio input controls — Enabled toggle + input device picker.
+
+        The device is remembered by *name* (USB indices shuffle between boots)
+        and audio analysis is re-enabled on launch if it was on last time.
+        """
+        box = QGroupBox("Audio (speaker + music detection)")
+        row = QHBoxLayout(box)
+        self._audio_enable_cb = QCheckBox("Enabled")
+        self._audio_enable_cb.setChecked(self._state.audio_enabled)
+        self._audio_enable_cb.setToolTip(
+            "Listen on the selected input to recognize enrolled speakers and detect music.\n"
+            "Models download on first use (see Manage People).")
+        self._audio_enable_cb.toggled.connect(self._on_audio_enabled_toggled)
+        row.addWidget(self._audio_enable_cb)
+
+        row.addWidget(QLabel("Input:"))
+        self._audio_combo = QComboBox()
+        self._populate_audio_devices_combo()
+        self._audio_combo.currentIndexChanged.connect(self._on_audio_device_changed)
+        row.addWidget(self._audio_combo, stretch=1)
+
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.setFixedWidth(70)
+        btn_refresh.clicked.connect(self._populate_audio_devices_combo)
+        row.addWidget(btn_refresh)
+        return box
+
+    def _populate_audio_devices_combo(self):
+        self._audio_combo.blockSignals(True)
+        self._audio_combo.clear()
+        self._audio_combo.addItem("(System default)", None)
+        for dev in list_input_devices():
+            self._audio_combo.addItem(
+                f"[{dev['index']}] {dev['name']} ({dev['max_channels']}ch)", dev)
+        # Re-select the remembered device by name
+        wanted = self._state.audio_device_name
+        if wanted:
+            for i in range(1, self._audio_combo.count()):
+                if self._audio_combo.itemData(i)['name'] == wanted:
+                    self._audio_combo.setCurrentIndex(i)
+                    break
+        self._audio_combo.blockSignals(False)
+
+    def _selected_audio_device(self) -> tuple[int | None, str]:
+        data = self._audio_combo.currentData()
+        if not data:
+            return None, ''
+        return data['index'], data['name']
+
+    def _apply_audio_settings(self, enable: bool):
+        index, _ = self._selected_audio_device()
+        self._audio_thread.set_device(index)
+        self._audio_thread.set_enabled(enable)
+
+    def _on_audio_enabled_toggled(self, on: bool):
+        _, name = self._selected_audio_device()
+        self._state.set(audio_enabled=on, audio_device_name=name)
+        self._persist()
+        self._apply_audio_settings(enable=on)
+        if self._people_win is not None:
+            self._people_win._refresh_audio_hint()
+
+    def _on_audio_device_changed(self, idx: int):
+        index, name = self._selected_audio_device()
+        self._state.set(audio_device_name=name)
+        self._persist()
+        self._audio_thread.set_device(index)
 
     # --- Shot type ---
 
@@ -1387,6 +1686,10 @@ class ControlWindow(QMainWindow):
         btn_diag = QPushButton("Open Diagnostics")
         btn_diag.clicked.connect(self._open_diagnostics)
         btn_row.addWidget(btn_diag)
+        btn_people = QPushButton("Manage People")
+        btn_people.setToolTip("Enroll people by face and voice, and set their priority.")
+        btn_people.clicked.connect(self._open_people)
+        btn_row.addWidget(btn_people)
         layout.addLayout(btn_row)
 
         # Foreground exclusion zone slider
@@ -1450,6 +1753,7 @@ class ControlWindow(QMainWindow):
                 f"Tracking: {meta['n_persons']} person(s)  |  "
                 f"Active: {meta['active_id']}"
                 + ("  |  searching…" if meta.get('searching') else "")
+                + f"  |  {self._audio_status_text}"
             )
         finally:
             self._video_thread.frame_consumed()
@@ -1586,6 +1890,56 @@ class ControlWindow(QMainWindow):
         self._diag_win.show()
         self._diag_win.raise_()
 
+    # ------------------------------------------------------------------
+    # Audio signal handlers
+    # ------------------------------------------------------------------
+
+    def _on_audio_state_changed(self, music_mode: bool, music_score: float,
+                                speech_score: float):
+        enabled_now = self._audio_thread.is_capturing
+        self._state.set(music_mode=music_mode, audio_music_score=music_score,
+                        audio_speech_score=speech_score)
+        mode_text = "MUSIC" if music_mode else "Speech"
+        self._audio_status_text = (
+            f"Audio: {mode_text} (m={music_score:.2f} s={speech_score:.2f})"
+            if enabled_now else "Audio: off")
+        # Reflect the real capture state (a device error turns it off).
+        if self._audio_enable_cb.isChecked() != enabled_now:
+            self._audio_enable_cb.blockSignals(True)
+            self._audio_enable_cb.setChecked(enabled_now)
+            self._audio_enable_cb.blockSignals(False)
+
+    def _on_speaker_detected(self, profile_id: str, name: str, score: float):
+        # Queue a voice boost for the VideoThread to apply on the next frame.
+        self._state.set(
+            pending_voice_boost=(profile_id, VOICE_PRIORITY_BOOST, SPEAKER_BOOST_HOLD_S),
+            audio_speaker_name=name,
+            audio_speaker_score=float(score),
+            audio_speaker_expires_at=time.monotonic() + SPEAKER_BOOST_HOLD_S,
+        )
+        self._audio_status_text = f"Audio: ● {name} ({score:.2f})"
+
+    def _on_audio_error(self, msg: str):
+        self._audio_status_text = f"Audio error: {msg}"
+        self._on_status(f"Audio error: {msg}")
+
+    def _open_people(self):
+        if self._people_win is None:
+            from people_ui import PeopleWindow
+            self._people_win = PeopleWindow(
+                self._profile_store,
+                frame_grabber=self._video_thread.grab_latest_frame,
+                audio_thread=self._audio_thread,
+                parent=self,
+            )
+            # Rebuild the live embedding indices whenever profiles change.
+            self._people_win.profiles_changed.connect(self._video_thread.reindex_profiles)
+            self._people_win.voice_profiles_changed.connect(
+                self._audio_thread.reindex_voice_profiles)
+        self._people_win.show()
+        self._people_win.raise_()
+        self._people_win.activateWindow()
+
     def _persist(self):
         self._state.save(self._settings)
 
@@ -1595,6 +1949,9 @@ class ControlWindow(QMainWindow):
         self._persist()
         self._settings.sync()
         self._video_thread.stop()
+        self._audio_thread.stop()
         self._output_win.close()
         self._diag_win.close()
+        if self._people_win is not None:
+            self._people_win.close()
         event.accept()

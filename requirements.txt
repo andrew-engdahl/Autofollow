@@ -1,5 +1,7 @@
+# Core — everything needed for tracking, framing, the control panel and headless mode.
 opencv-python>=4.10,<5
 numpy>=1.24.3
 ultralytics>=8.0.0
 torch>=2.1
 PyQt5>=5.15.0
+sounddevice>=0.4.6
