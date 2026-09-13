@@ -11,9 +11,10 @@ Layout::
             embeddings.npy        # (N, 512) face embeddings, one row per image
             embeddings_index.json # {image_filename: row_index}
 
-`priority` is a 0–10 integer. 0 = no boost (normal candidate). 10 = always
-preferred over unmatched subjects. Used by the switcher to bias selection
-and dwell toward important people (e.g. the pastor at a church).
+`priority` is a 0–10 integer. 0 = no boost (normal candidate). 10 = locked:
+Primary mode follows that person whenever they are on screen and nobody else
+can take over. Used by the switcher to bias selection and dwell toward
+important people (e.g. the pastor at a church).
 """
 
 from __future__ import annotations

@@ -46,8 +46,17 @@ def open_capture(index: int) -> cv2.VideoCapture | None:
 
 
 def describe_capture(cap: cv2.VideoCapture) -> tuple[int, int, float]:
-    """Return (width, height, fps) for an open capture."""
+    """Return (width, height, fps) for an open capture.
+
+    The size comes from the first delivered frame when possible: some drivers
+    and virtual cameras report a nominal mode that differs from what they
+    actually send.  Callers should still verify every frame with
+    FramingEngine.matches(), since capture devices can change mode mid-stream.
+    """
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    return w, h, fps
+    ok, frame = cap.read()
+    if ok and frame is not None and frame.size:
+        h, w = frame.shape[:2]
+    return int(w), int(h), fps

@@ -20,9 +20,9 @@ from camera import scan_cameras, open_capture, describe_capture
 from tracker import PersonTracker
 from framing_engine import FramingEngine
 from smoothing import PTZSmoother
-from switcher import VirtualSwitcher, _PRETRAVEL_DURATION
+from switcher import VirtualSwitcher, WIDE_ID, _PRETRAVEL_DURATION
 from profiles import ProfileStore
-from audio_thread import AudioThread, SPEAKER_BOOST_HOLD_S
+from audio_thread import AudioThread, SPEAKER_BOOST_HOLD_S, audio_models_installed
 from audio_capture import list_input_devices
 from face_worker import FaceRecognitionWorker
 from theme import (
@@ -43,6 +43,11 @@ VOICE_PRIORITY_BOOST = 5.0
 # Primary Focus dwell while music mode is active (performances want snappier
 # hand-offs than a sermon).
 _MUSIC_MODE_DWELL_SECONDS = 1.5
+
+# Profile priority at which Primary mode locks on: while exactly one person of
+# this priority is on screen they are the subject, full stop — no dwell, no
+# hand-off to anyone else.  Several of them compete by the normal rules.
+_LOCK_PRIORITY = 10
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +72,8 @@ _SKELETON = [
 _DIAG_MAX_WIDTH = 960
 
 # How fast to zoom out each frame while searching for a lost subject
-# (zoom units/frame).  At 30fps this goes from zoom 3 to the full frame in ~3s.
+# (reference zoom units/frame, rescaled by the smoother for the input size).
+# At 30fps this goes from zoom 3 to the full frame in ~3s.
 _SEARCH_ZOOM_OUT_RATE = 0.008
 
 # Camera watchdog: if no frame arrives for this long, try to re-open the device.
@@ -107,13 +113,35 @@ def _bgr_to_qimage(frame: np.ndarray) -> QImage:
 # App-wide shared state (written by UI thread, read by video thread)
 # ---------------------------------------------------------------------------
 
+def display_name(subject_id: str | None, persons: list | None = None,
+                 names: dict | None = None) -> str:
+    """Human label for a subject id: the matched profile's name if there is
+    one, 'Wide shot' for the switcher's wide pseudo-subject, else 'P<n>'.
+
+    ``persons`` is the diagnostics list of person dicts from VideoThread meta;
+    ``names`` an {id: name} map (either may be given).
+    """
+    if subject_id in (None, 'none', 'disabled'):
+        return '—'
+    if subject_id == WIDE_ID:
+        return 'Wide shot'
+    name = None
+    if names:
+        name = names.get(subject_id)
+    if not name and persons:
+        name = next((p.get('profile_name') for p in persons
+                     if p.get('id') == subject_id), None)
+    return name or subject_id.replace('person', 'P')
+
+
 class AppState:
     # Fields persisted between launches (QSettings key → attribute).
     _PERSISTED = (
         'camera_index', 'tracking_mode', 'shot_type', 'switch_mode',
         'switch_trigger', 'switch_interval', 'crossfade_duration',
-        'auto_follow_enabled', 'foreground_exclusion_y', 'max_persons',
-        'diag_overlays', 'display_index', 'audio_enabled', 'audio_device_name',
+        'auto_follow_enabled', 'follow_named_only', 'foreground_exclusion_y',
+        'max_persons', 'diag_overlays', 'display_index', 'audio_enabled',
+        'audio_device_name',
     )
 
     def __init__(self):
@@ -128,6 +156,8 @@ class AppState:
         self.manual_switch_id: str | None = None         # set by UI, consumed by video thread
         self.camera_change_requested: bool = False
         self.auto_follow_enabled: bool = True
+        # Primary mode only adopts people matched to an enrolled profile.
+        self.follow_named_only: bool = True
         self.foreground_exclusion_y: float = config.FOREGROUND_EXCLUSION_Y
         self.max_persons: int = config.MAX_PERSONS
         self.diag_visible: bool = False                  # diagnostics window is on screen
@@ -162,6 +192,7 @@ class AppState:
                 'switch_interval': self.switch_interval,
                 'crossfade_duration': self.crossfade_duration,
                 'auto_follow_enabled': self.auto_follow_enabled,
+                'follow_named_only': self.follow_named_only,
                 'foreground_exclusion_y': self.foreground_exclusion_y,
                 'max_persons': self.max_persons,
                 'diag_visible': self.diag_visible,
@@ -254,7 +285,7 @@ class VideoThread(QThread):
     camera_info = pyqtSignal(str)             # e.g. "1920x1080 @ 30fps"
     status = pyqtSignal(str)                  # human-readable pipeline state / errors
     model_ready = pyqtSignal()                # pose model loaded; pipeline about to start
-    persons_updated = pyqtSignal(list)        # list of person IDs currently tracked
+    persons_updated = pyqtSignal(list)        # [(person id, profile name or None)] currently tracked
 
     def __init__(self, state: AppState, profile_store: ProfileStore | None = None,
                  parent=None):
@@ -265,6 +296,7 @@ class VideoThread(QThread):
         # Pipeline components.  The detector is created in run() so the heavy
         # torch/ultralytics import and model load happen off the UI thread.
         self._cap = None
+        self._cap_fps = 30.0
         self._detector = None
         self._tracker = PersonTracker()
         self._framing: FramingEngine | None = None
@@ -278,6 +310,7 @@ class VideoThread(QThread):
         self._face_worker = (FaceRecognitionWorker(profile_store)
                              if profile_store is not None else None)
         self._face_error_reported = False
+        self._recognition_usable = False   # recognizer loaded and ≥1 profile enrolled
 
         # Latest raw camera frame — used by the People UI to capture reference
         # images.  cap.read() hands us a fresh buffer every frame and nothing in
@@ -288,7 +321,7 @@ class VideoThread(QThread):
 
         self._person_index_map: dict[str, int] = {}   # stable color index per person ID
         self._next_person_color_idx: int = 0
-        self._last_person_ids: list[str] = []
+        self._last_person_ids: list[tuple[str, str | None]] = []
 
         # Primary Focus state
         self._primary_id: str | None = None
@@ -367,6 +400,13 @@ class VideoThread(QThread):
             with self._latest_frame_lock:
                 self._latest_frame = frame
 
+            # Trust the frame, not the driver: size the pipeline to what the
+            # camera actually delivers, and re-size if it changes mid-stream.
+            if self._framing is None or not self._framing.matches(frame):
+                fh, fw = frame.shape[:2]
+                self._set_input_size(fw, fh, detected=True)
+                self._reset_tracking()
+
             result = self._process_frame(frame, settings)
             self._frame_count += 1
             if result is None:
@@ -427,10 +467,24 @@ class VideoThread(QThread):
                 self.status.emit(f"Could not open camera {index}")
             return
         w, h, fps = describe_capture(self._cap)
+        self._cap_fps = fps
+        self._set_input_size(w, h)
+        self.status.emit(f"Camera {index} ready")
+
+    def _set_input_size(self, w: int, h: int, detected: bool = False):
+        """Rebuild the resolution-dependent parts of the pipeline for a w×h input.
+
+        Called when a camera is opened and again whenever a delivered frame
+        has a different size (driver reported the wrong mode, or a capture
+        device switched sources).  The framing engine, smoother bounds and
+        speed scaling all derive from this size.
+        """
+        if self._framing is not None and detected:
+            self.status.emit(
+                f"Input changed to {w}×{h} — reframing for the new resolution")
         self._framing = FramingEngine(w, h)
         self._smoother.set_bounds(w, h)
-        self.camera_info.emit(f"{w}×{h} @ {fps:.0f} fps")
-        self.status.emit(f"Camera {index} ready")
+        self.camera_info.emit(f"{w}×{h} @ {self._cap_fps:.0f} fps")
 
     def _reset_tracking(self):
         """Forget everything about the previous scene (camera change / reconnect)."""
@@ -470,6 +524,8 @@ class VideoThread(QThread):
 
         # Face recognition: apply results from the last pass, then hand this
         # frame to the worker if it's idle and there is anything to match.
+        # A match may re-identify a body as an earlier track (same person back
+        # in frame), which is why TrackedPerson.id is re-read below, not cached.
         if self._face_worker is not None and persons:
             for m in self._face_worker.poll() or ():
                 self._tracker.set_profile_match(
@@ -491,6 +547,15 @@ class VideoThread(QThread):
             self._tracker.apply_voice_boost(profile_id, boost, hold)
         self._tracker.expire_transients()
 
+        # "Named people only" can only mean something while recognition is
+        # working and someone is enrolled; otherwise Primary mode would follow
+        # nobody, so fall back to following everyone.
+        if self._frame_count % FACE_RECOGNITION_INTERVAL == 0:
+            self._recognition_usable = (self._face_worker is not None
+                                        and self._face_worker.available
+                                        and self._face_worker.has_profiles())
+        named_only = bool(settings.get('follow_named_only', True)) and self._recognition_usable
+
         # Sync switcher settings from UI state
         self._switcher.music_mode = bool(settings.get('music_mode', False))
         self._switcher.switch_mode = settings['switch_mode']
@@ -503,8 +568,9 @@ class VideoThread(QThread):
         if manual_id:
             self._switcher.force_switch(manual_id)
 
-        # Tell the UI which people exist — only when the set actually changes
-        ids = [p.id for p in persons]
+        # Tell the UI which people exist (and what to call them) — only when
+        # the set or a name actually changes.
+        ids = [(p.id, p.profile_name) for p in persons]
         if ids != self._last_person_ids:
             self._last_person_ids = ids
             self.persons_updated.emit(ids)
@@ -529,7 +595,8 @@ class VideoThread(QThread):
             self._disabled_transition_start = None
 
             if mode == 'primary' or not persons:
-                output_frame = self._render_primary(frame, persons, shot_type, settings)
+                output_frame = self._render_primary(frame, persons, shot_type, settings,
+                                                    named_only=named_only)
                 active_id = self._primary_id or 'none'
             else:
                 output_frame, active_id = self._render_switcher(frame, persons, shot_type)
@@ -584,6 +651,7 @@ class VideoThread(QThread):
             'dwell_elapsed': time.monotonic() - self._primary_last_switch_time,
             'dwell_threshold': self._primary_dwell(music_mode),
             'mode': mode,
+            'named_only': named_only,
             'smoother_primary': self._smoother.get_state('primary'),
             'searching': self._searching,
             'person_index_map': dict(self._person_index_map),
@@ -679,13 +747,14 @@ class VideoThread(QThread):
 
             # ── ID + score label ─────────────────────────────────────────
             # Prefer the matched profile name over the generic personN ID;
-            # ★N shows static priority, ● shows an active voice boost.
+            # *N shows static priority, +voice an active voice boost.  ASCII
+            # only: OpenCV's Hershey fonts draw anything else as '?'.
             id_text = person.profile_name or person.id
             if person.profile_name and person.profile_priority > 0:
-                id_text = f"★{person.profile_priority} {id_text}"
+                id_text = f"{id_text} *{person.profile_priority}"
             if person.voice_boost > 0:
-                id_text = f"● {id_text}"
-            label = f"{'▶ ' if is_primary else ''}{id_text}"
+                id_text = f"{id_text} +voice"
+            label = f"{'> ' if is_primary else ''}{id_text}"
             font = cv2.FONT_HERSHEY_SIMPLEX
             lscale, lthick = 0.5, 1
             (tw, th), _ = cv2.getTextSize(label, font, lscale, lthick)
@@ -733,6 +802,52 @@ class VideoThread(QThread):
     def _held(self, key: str) -> tuple[float, float, float]:
         s = self._smoother.get_state(key)
         return s['x'], s['y'], s['zoom']
+
+    def _crop_rect(self, x: float, y: float, zoom: float) -> tuple[float, float, float, float]:
+        """Source-pixel rectangle apply_crop() would show for this camera."""
+        zoom = max(zoom, self._framing.min_zoom)
+        crop_w = min(self._framing.input_width, config.OUTPUT_WIDTH / zoom)
+        crop_h = min(self._framing.input_height, config.OUTPUT_HEIGHT / zoom)
+        x = min(max(x, 0.0), self._framing.input_width - crop_w)
+        y = min(max(y, 0.0), self._framing.input_height - crop_h)
+        return x, y, x + crop_w, y + crop_h
+
+    @staticmethod
+    def _in_shot(persons, rect) -> set[str]:
+        """Ids of the people whose bbox center lies inside ``rect``."""
+        x1, y1, x2, y2 = rect
+        out = set()
+        for p in persons:
+            cx = (p.bbox[0] + p.bbox[2]) / 2.0
+            cy = (p.bbox[1] + p.bbox[3]) / 2.0
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                out.add(p.id)
+        return out
+
+    def _jump_cut_blocked(self, live_key: str, persons, shot_type: str) -> set[str]:
+        """People an automatic switch must not go to right now.
+
+        Cutting to a shot that repeats someone already on screen reads as a
+        jump cut, so a candidate is blocked when the shot we'd frame on them
+        and the shot currently on air (camera ``live_key``) contain any person
+        in common — the candidate themselves, the current subject, or a
+        bystander.  The wide shot is exempt: pushing in from wide is a normal
+        cut, and without the exemption nothing could ever leave it.
+        """
+        live = self._smoother.get_state(live_key)
+        if live is None or live['zoom'] <= self._framing.min_zoom * 1.02:
+            return set()
+        on_air = self._in_shot(persons, self._crop_rect(live['x'], live['y'], live['zoom']))
+        blocked = set()
+        for p in persons:
+            tx, ty, tz = self._framing.calculate_target(p, shot_type)
+            if on_air & self._in_shot(persons, self._crop_rect(tx, ty, tz)):
+                blocked.add(p.id)
+        return blocked
+
+    def _wide_cam(self, key: str) -> tuple[float, float, float]:
+        """Advance smoother ``key`` toward the full-frame wide shot."""
+        return self._smoother.update(key, *self._framing.default_target())
 
     def _render_disabled(self, frame, settings: dict):
         """Auto-follow off: ease out to the full-frame wide shot and stay there."""
@@ -826,14 +941,28 @@ class VideoThread(QThread):
         """Nudge the held camera wider, keeping the crop centered on the same spot."""
         self._smoother.widen('primary', _SEARCH_ZOOM_OUT_RATE, self._framing.min_zoom)
 
-    def _render_primary(self, frame, persons, shot_type, settings: dict):
+    def _render_primary(self, frame, persons, shot_type, settings: dict,
+                        named_only: bool = False):
         """Track the nearest (largest bbox) person as primary.
+
+        With ``named_only`` only people currently matched to an enrolled
+        profile can be adopted or handed off to; unmatched people are ignored
+        (the camera searches on the wide shot until a named person appears).
+        The current primary is still followed while their face is out of view
+        — their track *is* them until recognition says otherwise.
+
+        Priority: a candidate's profile priority lowers the size advantage it
+        needs to take over (and a higher-priority candidate who is about as
+        close takes over at once).  Priority _LOCK_PRIORITY is absolute: if
+        one such person is on screen they are followed and nobody else can
+        take over; if several are, they compete among themselves.
 
         Primary persistence:
           - Stays on the current subject while they are visible.
           - Switches to a closer subject when their foreground_score is ≥1.5×
             the current one, or when they are ≥2× more active — but only after
-            PRIMARY_DWELL_SECONDS on the current subject.
+            PRIMARY_DWELL_SECONDS on the current subject, and never to a shot
+            that would repeat someone already on screen (_jump_cut_blocked).
           - All switches use the same pretravel → cut/crossfade pipeline as
             VirtualSwitcher, and the new subject's camera position is carried
             over so nothing pans after the transition.
@@ -854,13 +983,16 @@ class VideoThread(QThread):
 
         by_id = {p.id: p for p in persons}
         primary_present = self._primary_id in by_id
+        eligible = [p for p in persons if p.profile_id is not None] if named_only else persons
+        locked = [p for p in eligible if p.profile_priority >= _LOCK_PRIORITY]
 
         # ── Search / reacquire ───────────────────────────────────────────
         if not primary_present and self._primary_pending_id is None:
             if not self._searching:
                 self._searching = True
                 self._search_start = now
-            candidate = self._pick_subject(persons, music_mode) if persons else None
+            pool = locked or eligible
+            candidate = self._pick_subject(pool, music_mode) if pool else None
             waited = now - self._search_start
             if candidate is not None and (
                     self._primary_id is None or waited >= config.PRIMARY_REACQUIRE_DELAY):
@@ -878,9 +1010,23 @@ class VideoThread(QThread):
         # guests stay fully eligible whenever they're clearly closer.  Both
         # scores are EMA-smoothed in the tracker so single-frame noise can't
         # trigger a switch, and the dwell time prevents ping-ponging.
-        others = [p for p in persons if p.id != self._primary_id]
-        if (primary_present and self._primary_pending_id is None and others
-                and now - self._primary_last_switch_time >= self._primary_dwell(music_mode)):
+        others = [p for p in eligible if p.id != self._primary_id]
+        if primary_present and self._primary_pending_id is None:
+            current_locked = by_id[self._primary_id].profile_priority >= _LOCK_PRIORITY
+            if locked and not current_locked:
+                # A top-priority person is on screen and not on air: take them
+                # now, regardless of dwell or the jump-cut gate.
+                self._begin_primary_transition(self._pick_subject(locked, music_mode).id, now)
+            elif current_locked:
+                # Only another top-priority person may take over from a locked primary.
+                others = [p for p in locked if p.id != self._primary_id]
+        gate_open = (primary_present and self._primary_pending_id is None and others
+                     and now - self._primary_last_switch_time >= self._primary_dwell(music_mode))
+        if gate_open:
+            # No hand-off to a shot that repeats someone already on screen.
+            blocked = self._jump_cut_blocked('primary', persons, shot_type)
+            others = [p for p in others if p.id not in blocked]
+        if gate_open and others:
             current_p = by_id[self._primary_id]
             if music_mode:
                 # The most active performer (singing, soloing, leading) is the
@@ -945,6 +1091,10 @@ class VideoThread(QThread):
         When a switch is queued the pending person's smoother is advanced every
         frame (pretravel phase) so the virtual camera has already arrived at the
         new subject's position by the time the cut or crossfade fires.
+
+        Automatic switches never go to a shot that repeats someone already on
+        screen; if that rules everyone out the timed trigger goes to the wide
+        shot (WIDE_ID), which is rendered here like any other subject.
         """
         by_id = {p.id: p for p in persons}
 
@@ -954,16 +1104,28 @@ class VideoThread(QThread):
             _, _, cur_zoom = self._framing.calculate_target(current_person, shot_type)
             self._switcher.current_crop_width = config.OUTPUT_WIDTH / cur_zoom
 
-        active_id = self._switcher.decide(persons)
-        active_person = by_id.get(active_id, persons[0])
-        ax, ay, az = self._follow(active_id, active_person, shot_type)
-        frame_active = self._framing.apply_crop(frame, ax, ay, az)
+        blocked = set()
+        if self._switcher.active_id not in (None, WIDE_ID):
+            blocked = self._jump_cut_blocked(self._switcher.active_id, persons, shot_type)
 
-        pending_person = by_id.get(self._switcher._pending_id)
-        if pending_person is None:
+        active_id = self._switcher.decide(persons, blocked)
+
+        def cam(pid: str):
+            """Advance and return the camera for a subject id, or None if gone."""
+            if pid == WIDE_ID:
+                return self._wide_cam(WIDE_ID)
+            person = by_id.get(pid)
+            if person is None:
+                return None
+            return self._follow(pid, person, shot_type)
+
+        active_cam = cam(active_id) or self._follow(persons[0].id, persons[0], shot_type)
+        frame_active = self._framing.apply_crop(frame, *active_cam)
+
+        pending_id = self._switcher._pending_id
+        pending_cam = cam(pending_id) if pending_id is not None else None
+        if pending_cam is None:
             return frame_active, active_id
-
-        px, py, pz = self._follow(pending_person.id, pending_person, shot_type)
 
         # Pretravel: advance the pending smoother off-screen so it's settled
         # before the transition becomes visible; keep showing the active frame.
@@ -972,7 +1134,7 @@ class VideoThread(QThread):
 
         # Crossfade: blend settled active and pending frames
         if self._switcher.is_transitioning:
-            frame_pending = self._framing.apply_crop(frame, px, py, pz)
+            frame_pending = self._framing.apply_crop(frame, *pending_cam)
             return self._switcher.blend(frame_active, frame_pending), active_id
 
         return frame_active, active_id
@@ -1019,6 +1181,7 @@ class DiagnosticsWindow(QMainWindow):
         self.setMinimumSize(900, 620)
         self.resize(1200, 820)
         self._last_active_id: str | None = None   # for detecting new switch events
+        self._last_names: dict[str, str] = {}      # id → label as of the last frame
         self._last_table_update: float = 0.0
 
         root = QWidget()
@@ -1267,7 +1430,11 @@ class DiagnosticsWindow(QMainWindow):
         if active_id != self._last_active_id and active_id not in ('none', 'disabled', None):
             ts = time.strftime("%H:%M:%S")
             reason = ''
-            if persons:
+            if active_id == WIDE_ID:
+                reason = '  [no clean cut — wide]'
+            elif self._last_active_id == WIDE_ID:
+                reason = '  [from wide]'
+            elif persons:
                 nearest = persons[0]
                 fg_r  = nearest['fg_score'] / max(curr_fg,  1e-6)
                 act_r = nearest['activity'] / max(curr_act, 1e-6)
@@ -1280,7 +1447,8 @@ class DiagnosticsWindow(QMainWindow):
                 if not why:
                     why.append('reacquired')
                 reason = f"  [{', '.join(why)}]"
-            line = (f"{ts}   {self._last_active_id or '—'}  →  {active_id}"
+            line = (f"{ts}   {self._last_names.get(self._last_active_id, '—')}"
+                    f"  →  {display_name(active_id, persons)}"
                     f"   dwell {dwell:.2f}s{reason}")
             self._log.append(line)
             # Trim to max lines
@@ -1293,11 +1461,18 @@ class DiagnosticsWindow(QMainWindow):
                 cursor.deleteChar()   # remove the trailing newline
             self._log.ensureCursorVisible()
         self._last_active_id = active_id
+        # Remember names so the log can label the *previous* subject even if
+        # they have already left the frame.
+        self._last_names = {p['id']: display_name(p['id'], persons) for p in persons}
+        self._last_names[WIDE_ID] = 'Wide shot'
 
     def _refresh_panels(self, meta, mode, primary_id, pending_id, phase,
                         dwell, dwell_threshold, gate_open, fps):
         mode_color = {'primary': ACCENT, 'switcher': CYAN, 'disabled': DIM}.get(mode, MUTED)
-        set_pill(self._pill_mode, mode.upper(), mode_color)
+        mode_text = mode.upper()
+        if mode == 'primary' and meta.get('named_only'):
+            mode_text += ' · NAMED'
+        set_pill(self._pill_mode, mode_text, mode_color)
         phase_color = {'steady': GREEN, 'searching': AMBER, 'pretravel': PURPLE,
                        'crossfade': PURPLE, 'disabled': DIM}.get(phase, MUTED)
         set_pill(self._pill_phase, phase, phase_color)
@@ -1306,12 +1481,12 @@ class DiagnosticsWindow(QMainWindow):
         face_ms = meta.get('face_ms', 0.0)
         self._lbl_face_ms.setText(f"{face_ms:.0f} ms" if face_ms > 0 else "—")
 
-        active_name = primary_id if primary_id not in (None, 'none', 'disabled') else '—'
-        person = next((p for p in meta.get('persons', []) if p['id'] == primary_id), None)
-        if person is not None and person.get('profile_name'):
-            active_name = f"{person['profile_name']}  ·  {primary_id}"
+        persons = meta.get('persons', [])
+        active_name = display_name(primary_id, persons)
+        if active_name not in ('—', 'Wide shot') and active_name != primary_id.replace('person', 'P'):
+            active_name = f"{active_name}  ·  {primary_id}"
         self._lbl_active.setText(active_name)
-        self._lbl_pending.setText(pending_id or '—')
+        self._lbl_pending.setText(display_name(pending_id, persons))
         self._lbl_mode.setText(mode)
         self._lbl_phase.setText(phase)
 
@@ -1526,23 +1701,45 @@ class ControlWindow(QMainWindow):
         self._audio_thread.speaker_detected.connect(self._on_speaker_detected)
         self._audio_thread.error.connect(self._on_audio_error)
         self._audio_thread.status.connect(self._on_status)
+        self._audio_thread.status.connect(self._on_audio_loading_status)
+        self._audio_thread.models_ready.connect(self._on_audio_models_ready)
         self._audio_status_text = "Audio off"
 
         self._preview = VideoSurface(radius=10, background="#000000")
-        self._preview.set_placeholder("Starting camera…")
         self._preview.setMinimumSize(400, 225)
+        # If the music/speech models are installed, load them now — before the
+        # first frame is shown — rather than on the first audio tick, when a
+        # TensorFlow import would stall the picture mid-show.  The monitor
+        # shows a loading indicator and holds back frames until they're in.
+        self._awaiting_models = audio_models_installed()
+        self._audio_thread.preload_models = self._awaiting_models
+        if self._awaiting_models:
+            self._preview.set_loading("Loading music & speech models…")
+        else:
+            self._preview.set_placeholder("Starting camera…")
 
         self._last_status: str = ""
         self._last_frame_at: float = 0.0
         self._build_ui()
         self._video_thread.start()
+        # The audio thread preloads its models first (see _preload), then
+        # models_ready restores audio analysis if it was on last time.
         self._audio_thread.start()
-        # If audio analysis was on last time, bring it back only once the pose
-        # model is loaded: importing TensorFlow / loading YAMNet at the same
-        # time starves the video thread and delays the first frame by seconds.
+
+    def _on_audio_loading_status(self, text: str):
+        """Mirror model-loading progress on the monitor's loading indicator."""
+        if self._awaiting_models and text.startswith("Loading"):
+            self._preview.set_loading(text)
+
+    def _on_audio_models_ready(self):
+        """Audio models are in memory: release the monitor and restore audio."""
+        if self._awaiting_models:
+            self._awaiting_models = False
+            self._preview.set_loading(None)
+            if self._cam_info_label.text() != "not available":
+                self._preview.set_placeholder("Starting camera…")
         if self._state.audio_enabled:
-            self._video_thread.model_ready.connect(
-                lambda: self._apply_audio_settings(enable=self._state.audio_enabled))
+            self._apply_audio_settings(enable=True)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1793,7 +1990,7 @@ class ControlWindow(QMainWindow):
         card = Card("Follow mode")
         triggers = [
             ("Off",     "disabled", "Show the full camera frame; no tracking."),
-            ("Primary", "primary",  "Follow the closest person; hand off when someone closer or more active appears."),
+            ("Primary", "primary",  "Follow the closest enrolled person; hand off when someone closer or more active appears."),
             ("Timed",   "time",     "Rotate between tracked people on a fixed interval."),
             ("Manual",  "manual",   "Only switch when you press a person button below."),
         ]
@@ -1813,6 +2010,17 @@ class ControlWindow(QMainWindow):
         self._mode_hint.setObjectName("muted")
         self._mode_hint.setWordWrap(True)
         card.body.addWidget(self._mode_hint)
+
+        # Named-only (primary trigger only)
+        self._named_only_cb = QCheckBox("Only follow enrolled people")
+        self._named_only_cb.setChecked(self._state.follow_named_only)
+        self._named_only_cb.setToolTip(
+            "Primary mode only adopts people recognized from the People list.\n"
+            "Until one is on stage the camera waits on the wide shot.\n"
+            "Falls back to following everyone when face recognition is unavailable\n"
+            "or nobody has a face enrolled.")
+        self._named_only_cb.toggled.connect(self._on_named_only_toggled)
+        card.body.addWidget(self._named_only_cb)
 
         # Interval (time trigger only)
         self._interval_spin = QDoubleSpinBox()
@@ -1951,6 +2159,11 @@ class ControlWindow(QMainWindow):
 
     def _on_frame(self, qimg: QImage, meta: dict):
         try:
+            if self._awaiting_models:
+                # Keep the pipeline (and diagnostics log) running, but don't
+                # put the picture up until the audio models have loaded.
+                self._diag_win.update_diagnostics(meta)
+                return
             self._preview.set_image(qimg)
             if self._output_win.isVisible():
                 self._output_win.update_frame(qimg)
@@ -1963,11 +2176,10 @@ class ControlWindow(QMainWindow):
             self._last_frame_at = time.monotonic()
             self._fps_label.setText(f"{meta['fps']:.1f}")
             self._tracked_label.setText(str(meta['n_persons']))
-            active = meta['active_id']
             if meta.get('searching'):
                 active = "searching…"
-            elif active in ('none', 'disabled'):
-                active = "—"
+            else:
+                active = display_name(meta['active_id'], meta.get('persons'))
             self._active_label.setText(active)
         finally:
             self._video_thread.frame_consumed()
@@ -1985,10 +2197,12 @@ class ControlWindow(QMainWindow):
         self._last_status = text
         self._status_label.setText(text)
 
-    def _on_persons_updated(self, person_ids: list):
-        # Rebuild manual person buttons to match currently tracked IDs
+    def _on_persons_updated(self, persons: list):
+        # Rebuild manual person buttons to match currently tracked people;
+        # chips are labelled by profile name when the person is recognized.
+        names = dict(persons)
         existing = set(self._person_buttons.keys())
-        current = set(person_ids)
+        current = set(names)
 
         for pid in existing - current:
             btn = self._person_buttons.pop(pid)
@@ -2000,14 +2214,19 @@ class ControlWindow(QMainWindow):
             return int(digits) if digits else 0
 
         for pid in sorted(current - existing, key=_track_no):
-            btn = QPushButton(pid.replace('person', 'P'))
+            btn = QPushButton()
             btn.setObjectName("personChip")
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setToolTip(f"Switch to {pid}")
             btn.clicked.connect(lambda checked, p=pid: self._manual_switch(p))
             self._person_buttons[pid] = btn
             # Keep the trailing stretch last so chips stay left-aligned.
             self._persons_row.insertWidget(self._persons_row.count() - 1, btn)
+
+        for pid, btn in self._person_buttons.items():
+            label = display_name(pid, names=names)
+            if btn.text() != label:
+                btn.setText(label)
+                btn.setToolTip(f"Switch to {label}" + (f"  ({pid})" if names.get(pid) else ""))
         self._persons_empty.setVisible(not self._person_buttons)
 
     def _manual_mode_active(self) -> bool:
@@ -2047,8 +2266,13 @@ class ControlWindow(QMainWindow):
     def _update_trigger_ui(self, trigger_key: str):
         """Show/hide controls based on selected trigger."""
         self._mode_hint.setText(self._MODE_HINTS.get(trigger_key, ""))
+        self._named_only_cb.setVisible(trigger_key == 'primary')
         self._interval_row.setVisible(trigger_key == 'time')
         self._manual_row.setVisible(trigger_key == 'manual')
+
+    def _on_named_only_toggled(self, on: bool):
+        self._state.set(follow_named_only=on)
+        self._persist()
 
     def _on_interval_changed(self, val: float):
         self._state.set(switch_interval=val)

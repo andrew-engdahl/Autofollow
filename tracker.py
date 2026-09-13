@@ -5,12 +5,17 @@ import numpy as np
 from dataclasses import dataclass
 import config
 from config import MAX_PERSONS, FOREGROUND_EXCLUSION_Y as _DEFAULT_EXCLUSION_Y
+from geometry import px_scale
 
 _IOU_THRESHOLD = 0.10   # minimum IoU to match; lowered to tolerate fast movement
 _BBOX_ALPHA = 0.5       # bbox smoothing: higher = follows detection more closely (less lag)
+_KP_ALPHA = 0.5         # keypoint smoothing (the framing zoom/tilt come from keypoints)
+_KP_MIN_CONF = 0.3      # only smooth between two confident sightings of a keypoint
 _ACTIVITY_EMA_ALPHA = 0.3   # EMA smoothing for activity score — damps single-frame spikes
 _ACTIVITY_DX_WEIGHT = 2.0   # horizontal displacement weight (heavier — indicates engagement)
 _ACTIVITY_DY_WEIGHT = 1.0   # vertical displacement weight
+# Activity is measured in reference (720p) pixels, so the noise floors that
+# gate activity-based switching mean the same thing on a 4K camera.
 
 # Center-distance fallback matching: if IoU is too low (person moved fast), accept a
 # match when the detection center is within this fraction of the frame's diagonal.
@@ -45,7 +50,7 @@ class TrackedPerson:
     keypoints: np.ndarray            # (17, 4) — [x_norm, y_norm, 0, conf]
     confidence: float
     foreground_score: float = 0.0    # EMA-smoothed bbox_area / frame_area — larger = closer
-    activity_score: float = 0.0      # EMA-smoothed weighted center displacement
+    activity_score: float = 0.0      # EMA-smoothed weighted torso displacement (reference px)
     frames_unseen: int = 0           # consecutive detector passes without a match
     last_seen: float = 0.0           # time.monotonic() of the last matched detection
     # Face-recognition match (populated by FaceRecognizer via PersonTracker.set_profile_match)
@@ -119,6 +124,20 @@ def _area(bbox):
     return max(0, x2 - x1) * max(0, y2 - y1)
 
 
+def _smooth_keypoints(prev: np.ndarray, new: np.ndarray) -> np.ndarray:
+    """EMA the keypoint positions the framing engine reads (hips, shoulders…).
+
+    A keypoint is blended only when it was confident in both the previous and
+    the new detection; one that just (re)appeared, or is uncertain, is taken
+    as detected so the smoothing never drags a limb from a stale position.
+    Confidences are always the new detection's.
+    """
+    out = new.copy()
+    both = (prev[:, 3] >= _KP_MIN_CONF) & (new[:, 3] >= _KP_MIN_CONF)
+    out[both, :2] = prev[both, :2] * (1.0 - _KP_ALPHA) + new[both, :2] * _KP_ALPHA
+    return out
+
+
 class PersonTracker:
     """Maintains stable person identities across frames using greedy IoU matching.
 
@@ -131,6 +150,11 @@ class PersonTracker:
         self._tracks: dict[str, TrackedPerson] = {}   # id → TrackedPerson
         self._next_index = 1                           # for assigning 'person1', 'person2', …
         self._frame_area = 1.0
+        # profile_id → the track id that identity was last confirmed on.  Kept
+        # after the track drops so a recognized person who walks off and comes
+        # back gets their old id (and everything keyed on it) instead of being
+        # treated as a new person.
+        self._profile_track_ids: dict[str, str] = {}
 
     def update(self, detections: list[dict], frame_shape: tuple,
                foreground_exclusion_y: float | None = None,
@@ -147,6 +171,7 @@ class PersonTracker:
         fh, fw = frame_shape[:2]
         now = time.monotonic()
         self._frame_area = max(1.0, float(fw * fh))
+        ref_px = 1.0 / px_scale(fw, fh)   # source px → reference px
 
         # Drop detections whose torso center falls in the foreground exclusion zone.
         # Using the torso center (median of shoulders + hips) means a performer on stage
@@ -169,8 +194,8 @@ class PersonTracker:
             track = self._tracks[tid]
             prev_cx, prev_cy = _torso_center(track.keypoints, fw, fh, track.bbox)
             curr_cx, curr_cy = _torso_center(det['keypoints'], fw, fh, det['bbox'])
-            dx = abs(curr_cx - prev_cx)
-            dy = abs(curr_cy - prev_cy)
+            dx = abs(curr_cx - prev_cx) * ref_px
+            dy = abs(curr_cy - prev_cy) * ref_px
             raw_weighted = dx * _ACTIVITY_DX_WEIGHT + dy * _ACTIVITY_DY_WEIGHT
             activity = (_ACTIVITY_EMA_ALPHA * raw_weighted
                         + (1.0 - _ACTIVITY_EMA_ALPHA) * track.activity_score)
@@ -179,7 +204,7 @@ class PersonTracker:
                 int(old * (1 - _BBOX_ALPHA) + new * _BBOX_ALPHA)
                 for old, new in zip(track.bbox, det['bbox'])
             )
-            track.keypoints = det['keypoints']
+            track.keypoints = _smooth_keypoints(track.keypoints, det['keypoints'])
             track.confidence = det['confidence']
             raw_fg = _area(track.bbox) / self._frame_area
             track.foreground_score = (_FG_SCORE_EMA_ALPHA * raw_fg
@@ -268,25 +293,79 @@ class PersonTracker:
 
     def set_profile_match(self, person_id: str, profile_id: str | None,
                           profile_name: str | None, priority: int,
-                          score: float):
+                          score: float) -> str | None:
         """Attach (or clear) a face-recognition match to a tracked person.
 
-        A profile can only belong to one track at a time: if it was previously
-        attached to a different track (e.g. an ID swap after occlusion), that
-        track is cleared so priority doesn't get counted twice.
+        A recognized face is an identity, not a new person: if the profile was
+        last confirmed on a different track, the matched body is re-identified
+        as that track (see _reidentify), so the caller's primary/switcher state,
+        smoother state and colours all carry over.  Returns the id the match
+        ended up on (``person_id`` unless re-identified), or None if the track
+        no longer exists.
+
+        A profile can only belong to one track at a time: any other track still
+        carrying it (a stale match after a hand-off) is cleared so priority
+        doesn't get counted twice.
         """
         track = self._tracks.get(person_id)
         if track is None:
-            return
+            return None
         if profile_id is not None:
+            person_id = self._reidentify(person_id, profile_id, score)
+            if person_id is None:
+                return self._profile_track_ids[profile_id]
+            track = self._tracks[person_id]
             for other in self._tracks.values():
                 if other is not track and other.profile_id == profile_id:
                     self._clear_profile(other)
+            self._profile_track_ids[profile_id] = person_id
         track.profile_id = profile_id
         track.profile_name = profile_name
         track.profile_priority = int(priority)
         track.profile_score = float(score)
         track.face_seen_at = time.monotonic()
+        return person_id
+
+    def _reidentify(self, new_id: str, profile_id: str, score: float) -> str | None:
+        """Return the id the body at ``new_id`` should carry given a face match.
+
+        Cases when the profile was last seen on a different track:
+          - that track is gone (person left frame / was occluded past the
+            dropout): revive its id on the new body;
+          - it is alive and carries a *different* profile: it has since been
+            confirmed as someone else, so the new body simply becomes the
+            current owner of this profile;
+          - it is alive and still (freshly) matched to this profile with a
+            better score: the new face is probably a lookalike — return None
+            to ignore the match.  If it was really an ID swap the old match
+            goes stale within FACE_MATCH_STALE_SECONDS and the next pass
+            lands in the case below;
+          - otherwise the tracker followed the wrong body through a crossing:
+            swap the two ids so the recognized person keeps theirs.
+        """
+        old_id = self._profile_track_ids.get(profile_id)
+        if old_id is None or old_id == new_id:
+            return new_id
+        old = self._tracks.get(old_id)
+        if old is None:
+            self._rekey(new_id, old_id)
+            return old_id
+        if old.profile_id not in (None, profile_id):
+            return new_id
+        if old.profile_id == profile_id and score < old.profile_score:
+            return None
+        self._swap(new_id, old_id)
+        return old_id
+
+    def _rekey(self, from_id: str, to_id: str):
+        track = self._tracks.pop(from_id)
+        track.id = to_id
+        self._tracks[to_id] = track
+
+    def _swap(self, a: str, b: str):
+        ta, tb = self._tracks[a], self._tracks[b]
+        ta.id, tb.id = b, a
+        self._tracks[a], self._tracks[b] = tb, ta
 
     @staticmethod
     def _clear_profile(track: TrackedPerson):
@@ -363,4 +442,5 @@ class PersonTracker:
 
     def reset(self):
         self._tracks.clear()
+        self._profile_track_ids.clear()
         self._next_index = 1

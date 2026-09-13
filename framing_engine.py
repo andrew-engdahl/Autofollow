@@ -7,6 +7,7 @@ from config import (
     PADDING_RATIO, SHOT_TYPE, MAX_ZOOM, CONFIDENCE_THRESHOLD,
 )
 from tracker import TrackedPerson
+from geometry import wide_zoom, px_scale, frame_size
 
 # COCO keypoint indices used for shot framing
 _KP = {
@@ -53,14 +54,30 @@ class FramingEngine:
     Zoom is expressed relative to the output size: zoom 1.0 means the crop is
     exactly OUTPUT_WIDTH × OUTPUT_HEIGHT source pixels.  `min_zoom` is the
     zoom at which the crop covers the whole camera frame, so a "wide shot"
-    is genuinely wide whether the camera is 720p or 4K.
+    is genuinely wide whether the camera is 720p or 4K.  MAX_ZOOM is likewise
+    output-relative, which makes it a cap on how far the output is upscaled:
+    a higher-resolution input can legitimately push in further.
+
+    The engine is built for one input size — the size of the frames the
+    camera actually delivers, not what the driver claims.  Callers check
+    `matches(frame)` each frame and rebuild the engine when it changes.
     """
 
     def __init__(self, input_width: int, input_height: int):
         self.input_width = max(1, int(input_width))
         self.input_height = max(1, int(input_height))
-        self.min_zoom = max(OUTPUT_WIDTH / self.input_width,
-                            OUTPUT_HEIGHT / self.input_height)
+        self.min_zoom = wide_zoom(self.input_width, self.input_height)
+        # Source pixels per reference (720p wide-shot) pixel — see geometry.py.
+        self.px_scale = px_scale(self.input_width, self.input_height)
+
+    @classmethod
+    def for_frame(cls, frame: np.ndarray) -> "FramingEngine":
+        """Build an engine sized to an actual camera frame."""
+        return cls(*frame_size(frame))
+
+    def matches(self, frame: np.ndarray) -> bool:
+        """True if `frame` has the size this engine was built for."""
+        return frame_size(frame) == (self.input_width, self.input_height)
 
     # ------------------------------------------------------------------
     # Single-person target

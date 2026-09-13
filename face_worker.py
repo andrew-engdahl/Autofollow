@@ -200,7 +200,15 @@ class FaceRecognitionWorker:
                         "priority": face["priority"],
                         "score": face["score"],
                     }
-        return list(matches.values())
+        # One body per profile per pass: a profile is an identity, and the
+        # tracker re-identifies bodies by it, so two bodies claiming the same
+        # person in one pass (a lookalike) must not be allowed to fight.
+        best_by_profile: dict[str, dict] = {}
+        for m in matches.values():
+            prev = best_by_profile.get(m["profile_id"])
+            if prev is None or m["score"] > prev["score"]:
+                best_by_profile[m["profile_id"]] = m
+        return list(best_by_profile.values())
 
     @staticmethod
     def _crop_regions(bodies, fw, fh) -> list[tuple[int, int, int, int]]:

@@ -11,6 +11,11 @@ from config import SWITCH_MODE, SWITCH_TRIGGER, SWITCH_INTERVAL, CROSSFADE_DURAT
 # cut/crossfade always lands on a settled, well-framed shot rather than a cold start.
 _PRETRAVEL_DURATION = 0.5
 
+# Pseudo subject id for the full-frame wide shot.  The timed switcher falls
+# back to it when every other person would make a jump cut (someone in the
+# current shot would also be in theirs); from the wide shot anyone is fair game.
+WIDE_ID = 'wide'
+
 
 class VirtualSwitcher:
     """Decides when and how to switch between tracked persons.
@@ -44,6 +49,7 @@ class VirtualSwitcher:
         self._fade_start: float | None = None  # time.monotonic() when crossfade began
         self._last_switch_time: float = time.monotonic()
         self._manual_request: str | None = None
+        self._shown_at: dict[str, float] = {}     # subject id → when it last went on air
         self.current_crop_width: float = 0.0  # set by caller each frame for displacement gating
         # When True, the switcher uses music-performance defaults: shorter dwell,
         # activity-biased target selection, no priority dwell extension. Set by
@@ -78,26 +84,35 @@ class VirtualSwitcher:
         if person_id != self.active_id:
             self._manual_request = person_id
 
-    def decide(self, persons: list[TrackedPerson]) -> str | None:
-        """Evaluate trigger conditions; return person_id to activate (or None).
+    def decide(self, persons: list[TrackedPerson],
+               blocked: set[str] | None = None) -> str | None:
+        """Evaluate trigger conditions; return the id to activate (or None).
 
         Call once per frame. If a switch is warranted this method sets internal
         state and returns the new active_id. Callers should check is_transitioning
         to know whether to render two frames (crossfade).
+
+        ``blocked`` is the set of people the caller has ruled out as an
+        automatic target this frame — those whose shot would share a person
+        with the one on air (a jump cut).  A manual request ignores it.  When
+        the time trigger fires and nobody is left, the wide shot (WIDE_ID) is
+        taken instead, and the rotation resumes from there.
         """
         if not persons:
             return self.active_id
 
         now = time.monotonic()
         ids = [p.id for p in persons]
+        blocked = blocked or set()
 
         # Initialise active_id on first call, or re-adopt if the active person vanished.
-        if self.active_id is None or self.active_id not in ids:
+        if self.active_id is None or (self.active_id != WIDE_ID and self.active_id not in ids):
             # Prefer the person we were already heading toward, if still present.
-            if self._pending_id in ids:
+            if self._pending_id == WIDE_ID or self._pending_id in ids:
                 self.active_id = self._pending_id
             else:
                 self.active_id = persons[0].id
+            self._shown_at[self.active_id] = now
             self._pending_id = None
             self._pretraveling = False
             self._fade_start = None
@@ -150,31 +165,38 @@ class VirtualSwitcher:
                 active_prio = active_p.effective_priority if active_p else 0
                 effective_interval = self.interval * priority_weight(int(active_prio))
 
-            if now - self._last_switch_time >= effective_interval and len(persons) > 1:
+            on_wide = self.active_id == WIDE_ID
+            if now - self._last_switch_time >= effective_interval and (len(persons) > 1 or on_wide):
+                # From the wide shot every push-in is a legitimate cut, so the
+                # caller passes nothing as blocked; otherwise skip anyone whose
+                # shot would repeat a person already on screen.
+                candidates = [p for p in persons
+                              if p.id != self.active_id and p.id not in blocked]
                 if self.music_mode:
                     # Music mode: prefer the person with the highest activity
                     # (the band member who's moving / soloing / dancing). Ties
                     # break on foreground area. Priority is intentionally
                     # ignored so the pastor doesn't dominate a worship set.
-                    candidates = [p for p in persons if p.id != self.active_id]
                     if candidates:
                         candidates.sort(
                             key=lambda p: (p.activity_score, p.foreground_score),
                             reverse=True,
                         )
                         target = candidates[0].id
-                else:
-                    # Speech mode: cycle through every tracked person in order
-                    # so unmatched guests are always visited. Dwell scales by
-                    # priority (above), so priority people still get more
-                    # total airtime per cycle.
-                    try:
-                        current_idx = ids.index(self.active_id)
-                        target = ids[(current_idx + 1) % len(ids)]
-                    except ValueError:
-                        target = ids[0]
+                elif candidates:
+                    # Speech mode: visit the person who has been off air the
+                    # longest (never shown first), so unmatched guests are
+                    # always visited and nobody starves when the jump-cut
+                    # rule keeps skipping them from one particular shot.
+                    # Dwell scales by priority (above), so priority people
+                    # still get more total airtime per cycle.
+                    target = min(candidates,
+                                 key=lambda p: self._shown_at.get(p.id, float('-inf'))).id
+                if target is None and not on_wide:
+                    # Everyone else would be a jump cut: go wide instead.
+                    target = WIDE_ID
 
-        if target is not None and not is_manual:
+        if target is not None and not is_manual and target != WIDE_ID:
             # Only auto-switch if the candidate is significantly displaced from the
             # current shot center — prevents flickering between nearby subjects.
             if SWITCHER_MIN_DISPLACEMENT_RATIO > 0.0 and self.current_crop_width > 0.0:
@@ -216,6 +238,7 @@ class VirtualSwitcher:
     def _initiate_switch(self, target_id: str, now: float):
         # Always enter pretravel first so the camera can settle on the new subject
         # before the transition becomes visible.
+        self._shown_at[target_id] = now
         self._pending_id = target_id
         self._pretraveling = True
         self._pretravel_start = now

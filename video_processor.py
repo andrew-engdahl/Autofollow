@@ -44,12 +44,7 @@ class VideoProcessor:
             raise RuntimeError(f"Failed to open camera device {self.camera_index}")
 
         w, h, fps = describe_capture(self._cap)
-
-        self.input_width = w
-        self.input_height = h
-        self._framing = FramingEngine(w, h)
-        self._smoother.set_bounds(w, h)
-
+        self._set_input_size(w, h)
         print(f"Camera: {w}×{h} @ {fps:.1f} fps")
 
         if self.output_file:
@@ -59,11 +54,30 @@ class VideoProcessor:
 
         return w, h, fps
 
+    def _set_input_size(self, w: int, h: int):
+        """Size the framing pipeline to the frames the camera actually delivers."""
+        self.input_width = w
+        self.input_height = h
+        self._framing = FramingEngine(w, h)
+        self._smoother.set_bounds(w, h)
+
     def process_frame(self, frame: np.ndarray) -> dict:
         """Run the full pipeline on a single frame.
 
         Returns a dict with 'frame' (cropped output), 'persons', 'active_id'.
         """
+        # The input size is taken from the frame itself, so a camera that lied
+        # about its mode, or switched mode mid-stream, is handled here.  Track
+        # and camera state are in pixels of the old size, so start over.
+        if self._framing is None or not self._framing.matches(frame):
+            w, h = frame.shape[1], frame.shape[0]
+            if self._framing is not None:
+                print(f"Input resolution changed: {self.input_width}×{self.input_height}"
+                      f" → {w}×{h}")
+            self._set_input_size(w, h)
+            self._tracker.reset()
+            self._smoother.reset()
+
         # Detection only runs every DETECTION_INTERVAL frames; in between, keep
         # following the last known track positions (tracks expire on wall time).
         if self._frame_count % DETECTION_INTERVAL == 0:

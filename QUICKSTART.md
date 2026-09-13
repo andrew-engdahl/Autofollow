@@ -23,7 +23,7 @@ The control panel appears right away; wait for the status bar to change from *Lo
 1. **Devices → Camera** — pick the input. The label next to it shows the resolution/fps it opened at.
 2. **Devices → Output** — choose the projector/monitor, then **Go Fullscreen**. Esc, Q or double-click on the output closes it.
 3. **Follow mode**
-   - **Primary** — follows the closest person and hands off automatically. Good default for a single presenter or a panel.
+   - **Primary** — follows the closest person and hands off automatically. Good default for a single presenter or a panel. By default it only follows people enrolled under **People** (untick *Only follow enrolled people* to follow anyone).
    - **Timed** — rotates between everyone on stage every *Interval* seconds.
    - **Manual** — press **P1 / P2 / …** to pick who's on screen.
    - **Off** — full wide shot, no tracking.
@@ -52,13 +52,13 @@ Everything you set is remembered for next time.
 | `SMOOTHING` | 0 = responsive, 1 = very smooth/slow |
 | `DEADZONE` | How far the subject can drift before the camera pans |
 | `PRIMARY_DWELL_SECONDS` | Minimum time on a subject before a hand-off |
-| `DETECTION_INTERVAL` / `DETECTION_SCALE` | Trade detection accuracy for speed |
+| `DETECTION_INTERVAL` / `DETECTION_WIDTH` | Trade detection accuracy for speed |
 | `CAPTURE_WIDTH` / `CAPTURE_HEIGHT` | Ask the camera for a specific mode (0 = its default) |
 
 ## Troubleshooting
 
 - **No cameras found** → System Settings → Privacy & Security → Camera: allow Terminal / Autofollow.
 - **"No signal from camera — reconnecting…"** → the device dropped out; it reconnects on its own once it's back.
-- **Choppy** → raise `DETECTION_INTERVAL` to 3, or lower `DETECTION_SCALE` to 0.4.
+- **Choppy** → raise `DETECTION_INTERVAL` to 3, or lower `DETECTION_WIDTH` to 512.
 - **Too tight / too loose** → change Shot Type, or adjust `MAX_ZOOM`.
 - **Dock app won't open** → re-run `./setup.sh`.

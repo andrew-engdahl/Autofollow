@@ -55,7 +55,7 @@ The panel is a single dark window: the program monitor and device pickers on the
 | **Devices → Camera** | Choose the input device. *⟳* rescans without interrupting the live camera; the label shows the mode it opened at. |
 | **Devices → Audio** | Tick to analyze a microphone input for speaker recognition and music detection (needs the recognition extras). |
 | **Devices → Output** | The display used for fullscreen output. |
-| **Follow mode** | *Off* shows the whole frame. *Primary* follows the closest person. *Timed* rotates between people every N seconds. *Manual* switches only when you press a person chip. |
+| **Follow mode** | *Off* shows the whole frame. *Primary* follows the closest person — by default only people enrolled under **People** (untick *Only follow enrolled people* to follow anyone; it also follows anyone while recognition is unavailable or nobody is enrolled). *Timed* rotates between people every N seconds. *Manual* switches only when you press a person chip. Chips, the monitor strip and the diagnostics show a recognized person's name instead of `P1`. |
 | **Framing** | Shot: Full Body / Waist Up / Medium / Close-Up. Transition: Cut or Crossfade, with the fade time. Used for every subject change, including Primary hand-offs. |
 | **Tracking** | *Audience exclusion* ignores anyone whose torso is in the bottom N% of the frame (drawn in yellow in Diagnostics). *Max people* caps how many are tracked at once. |
 | **Go Fullscreen** | Opens the program output fullscreen on the chosen display. Esc, Q, or a double-click on the output closes it. |
@@ -74,7 +74,7 @@ All of these are saved and restored on the next launch (the audio device is reme
 2. Add reference photos from disk or **Capture from camera**. Saving embeds them (the first time downloads the InsightFace `buffalo_l` models, ~300 MB, to `~/.insightface/models/`).
 3. Optionally add **Voice Samples** — WAV/FLAC files, or **Record 5 s from mic** while Audio is enabled in the main panel. Aim for ≥10 s of clean speech per person.
 
-Once a profile has face embeddings, recognition runs on a background worker (a few times a second, on upper-body crops so distant faces are still legible) and the diagnostics overlay labels the person by name — `★8 Pastor Mike`, with `●` while their voice is recognized. A match is forgotten after 5 s without re-confirmation, so identities don't stick to the wrong track after people cross.
+Once a profile has face embeddings, recognition runs on a background worker (a few times a second, on upper-body crops so distant faces are still legible) and the diagnostics overlay labels the person by name — `Pastor Mike *8`, with `+voice` while their voice is recognized. A match is forgotten after 5 s without re-confirmation, so identities don't stick to the wrong track after people cross. A recognized face is treated as an identity, not a new person: someone who walks off and comes back keeps their original track (so the primary subject, colour and camera state carry over), and if the tracker followed the wrong body through a crossing the IDs are swapped back when the face is seen again.
 
 Profiles live in `~/Library/Application Support/Autofollow/profiles/`.
 
@@ -96,11 +96,11 @@ Tick **Audio** in the Devices card and pick an input. While on:
 
 ## How It Works
 
-1. **Detect** — YOLOv8-Pose runs every `DETECTION_INTERVAL` frames on a downscaled copy of the input and returns 17 COCO keypoints per person. People with no visible hips (typically foreground audience cut off at the waist) are ignored.
+1. **Detect** — YOLOv8-Pose runs every `DETECTION_INTERVAL` frames on a copy of the input downscaled to `DETECTION_WIDTH` and returns 17 COCO keypoints per person. People with no visible hips (typically foreground audience cut off at the waist) are ignored.
 2. **Track** — Detections are matched to existing tracks by IoU, with a center-distance fallback for fast movers, giving each person a stable ID. Tracks expire after `TRACK_DROPOUT_SECONDS` unseen. Each track carries an EMA-smoothed *foreground score* (bbox area) and *activity score* (torso movement).
-3. **Frame** — For the chosen shot type, the zoom is computed from the head and the shot's bottom landmark (hips, knees, ankles…) so the framing is consistent regardless of how far away the person is. Zoom is bounded between "the whole camera frame" and `MAX_ZOOM`.
-4. **Smooth** — A per-subject PTZ smoother tracks the crop *center* and zoom (never the crop origin), so a zoom grows or shrinks around a fixed point. Pan has a soft deadzone with quadratic ease-out; tilt and zoom have their own deadzones so keypoint noise never makes the shot creep or breathe. While the zoom is moving, the center is forced to converge at least as fast as the zoom, so every push-in or pull-out stays centered on the destination and arrives with no trailing pan or tilt. All axes are capped by `MAX_*_SPEED`.
-5. **Switch** — In Primary mode a hand-off needs the candidate to be ≥1.5× larger or ≥2× more active, and only after `PRIMARY_DWELL_SECONDS`. Profile priority shifts that threshold (a higher-priority person who is at least as close takes over immediately; a lower-priority one must be much closer) but never stops an unknown person who is clearly nearer. If the subject disappears, the camera holds and slowly widens; after `PRIMARY_REACQUIRE_DELAY` the best remaining person is adopted with the configured transition.
+3. **Frame** — The input resolution is detected from the frames the camera actually delivers (and re-detected if it changes mid-stream), never assumed from the driver. For the chosen shot type, the zoom is computed from the head and the shot's bottom landmark (hips, knees, ankles…) so the framing is consistent regardless of how far away the person is. Zoom is bounded between "the whole camera frame" and `MAX_ZOOM`.
+4. **Smooth** — A per-subject PTZ smoother tracks the crop *center* and zoom (never the crop origin), so a zoom grows or shrinks around a fixed point. Pixel- and zoom-unit tuning constants are expressed for a 720p input and rescaled to the detected resolution, so a 4K camera moves the same way on screen as a 720p one. Pan has a soft deadzone with quadratic ease-out; tilt and zoom have their own deadzones so keypoint noise never makes the shot creep or breathe. While the zoom is moving, the center is forced to converge at least as fast as the zoom, so every push-in or pull-out stays centered on the destination and arrives with no trailing pan or tilt. All axes are capped by `MAX_*_SPEED`.
+5. **Switch** — In Primary mode a hand-off needs the candidate to be ≥1.5× larger or ≥2× more active, and only after `PRIMARY_DWELL_SECONDS`. Profile priority shifts that threshold (a higher-priority person who is at least as close takes over immediately; a lower-priority one must be much closer) but never stops an unknown person who is clearly nearer — except at priority **10**, which is a lock: whenever exactly one priority-10 person is on screen, Primary follows them and nobody else can take over (they're adopted the moment they appear, dwell and jump-cut gate notwithstanding); several priority-10 people compete among themselves by the normal rules. A hand-off is also never made to a shot that would repeat someone already on screen (the candidate standing inside the current shot, or the current subject inside theirs) — that would read as a jump cut. If the subject disappears, the camera holds and slowly widens; after `PRIMARY_REACQUIRE_DELAY` the best remaining person is adopted with the configured transition. With *Only follow enrolled people* on (the default), only recognized people can be adopted or handed off to — the camera keeps waiting on the wide shot until one appears — but the current subject is still followed while their face is turned away. In Timed mode the same jump-cut rule applies: the next person is whoever has been off air longest among those whose shot shares nobody with the current one; if that rules everyone out, the switcher goes to the full-frame wide shot and resumes from there (from wide, any push-in is allowed). Manual picks are never blocked.
 
 ## Configuration
 
@@ -111,16 +111,16 @@ OUTPUT_WIDTH, OUTPUT_HEIGHT = 1280, 720   # program output size
 CAPTURE_WIDTH, CAPTURE_HEIGHT = 0, 0      # requested camera mode (0 = camera default)
 
 CONFIDENCE_THRESHOLD = 0.7   # keypoint / person confidence
-DETECTION_SCALE = 0.5        # run YOLO on this fraction of the input resolution
+DETECTION_WIDTH = 640        # downscale the input to this width for YOLO (0 = full size)
 DETECTION_INTERVAL = 2       # detect every N frames
 
 SHOT_TYPE = 'waist_up'
-MAX_ZOOM = 4.0               # relative to the output size
+MAX_ZOOM = 4.0               # relative to the output size (max upscale factor)
 DEADZONE = 0.4               # fraction of the viewport the subject can roam without panning
 SMOOTHING = 0.5              # 0 = responsive … 1 = very smooth
-MAX_PAN_SPEED = 15           # source px / frame
+MAX_PAN_SPEED = 15           # reference (720p) px / frame on the wide shot — scaled to the input and up with zoom
 MAX_TILT_SPEED = 3
-MAX_ZOOM_SPEED = 0.015
+MAX_ZOOM_SPEED = 0.012       # fraction of the current zoom per frame
 
 PRIMARY_DWELL_SECONDS = 3.0
 PRIMARY_REACQUIRE_DELAY = 1.0
@@ -130,8 +130,11 @@ TRACK_DROPOUT_SECONDS = 2.0
 ## Performance Notes
 
 - On Apple Silicon the model runs on Metal (`mps`); a 1080p camera processes at 30+ fps with detection every other frame.
-- Lower `DETECTION_SCALE` or raise `DETECTION_INTERVAL` for more headroom on slower machines; raise `DETECTION_SCALE` toward 1.0 if small, distant people are missed.
+- Lower `DETECTION_WIDTH` or raise `DETECTION_INTERVAL` for more headroom on slower machines; raise `DETECTION_WIDTH` (e.g. 960) if small, distant people are missed on a high-resolution camera.
 - Output frames are dropped rather than queued if the UI falls behind, so latency stays bounded.
+- When the recognition extras are installed, the music classifier (and the speaker model, if any voice is enrolled) are loaded at launch while the monitor shows a loading indicator; the picture appears once they're in memory, so a TensorFlow import never stalls the feed mid-show.
+- The virtual camera is acceleration-limited: each axis may only change its per-frame movement by a bounded amount, so the stepped, slightly noisy target that every-other-frame pose detection produces is turned into motion that eases in, cruises and eases out instead of being reproduced jolt for jolt. Keypoints are EMA-smoothed in the tracker (confidence-gated) for the same reason.
+- Pan, tilt and zoom speeds scale with how far the shot is pushed in: a subject crosses a tight shot `zoom×` faster on screen than the wide shot, so the smoother's gains and caps grow with zoom to keep the on-screen response the same at every framing, and zoom moves as a fraction of itself per frame with a ramp so a shot-type change is decisive while keypoint jitter still can't make the shot breathe.
 - Face recognition and audio analysis run on their own threads and never block the video pipeline; one shared InsightFace / SpeechBrain instance serves both live recognition and profile enrollment.
 - InsightFace runs on CoreML (Neural Engine) when available — ~25 ms per pass vs ~230 ms on CPU — falling back to a thread-capped CPU session. `AUTOFOLLOW_FACE_PROVIDERS=CPUExecutionProvider` forces CPU.
 - First-time model loads (YAMNet/TensorFlow in particular) briefly reduce the frame rate while they import; this happens once per session, after the camera is already running.

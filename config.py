@@ -13,11 +13,17 @@ OUTPUT_ASPECT_RATIO = 16 / 9
 CAMERA_INDEX = 0                  # Default camera device (0 = built-in)
 CAPTURE_WIDTH = 0                 # Requested capture size; 0 = leave the camera at its default.
 CAPTURE_HEIGHT = 0                # The driver picks the closest mode it supports.
+# The input resolution is never assumed: it is detected from the frames the
+# camera actually delivers (re-detected if it changes mid-stream), and the
+# framing pipeline adapts to it.  Constants below that are given in pixels or
+# zoom units are *reference* values tuned for a 1280×720 input; they are scaled
+# automatically for the detected size (see geometry.py), so a 4K camera gets
+# the same on-screen motion as a 720p one without retuning.
 
 # Pose detection
 CONFIDENCE_THRESHOLD = 0.7
 YOLO_MODEL = 'yolov8n-pose.pt'    # nano=n, small=s, medium=m, large=l
-DETECTION_SCALE = 0.5             # Run YOLO on this fraction of input resolution (0.25–1.0)
+DETECTION_WIDTH = 640             # Downscale input to this width for YOLO (0 = full resolution)
 DETECTION_INTERVAL = 2            # Run pose detection every N frames (1 = every frame)
 MAX_PERSONS = 10                  # Maximum simultaneous tracked people
 TRACK_DROPOUT_SECONDS = 2.0       # Forget a person after they have been unseen this long
@@ -25,7 +31,7 @@ TRACK_DROPOUT_SECONDS = 2.0       # Forget a person after they have been unseen 
 # Framing
 PADDING_RATIO = 0.15              # Padding below the shot's bottom landmark (fraction of body height)
 SHOT_TYPE = 'waist_up'            # 'full_body' | 'waist_up' | 'medium' | 'close_up'
-MAX_ZOOM = 4.0                    # Maximum zoom factor (relative to the output size)
+MAX_ZOOM = 4.0                    # Maximum zoom (relative to the output size, i.e. max upscale factor)
 DEADZONE = 0.4                    # Horizontal deadzone (0–1): fraction of viewport where subject moves without panning
 
 # Shot type zoom targets (before MAX_ZOOM clamping)
@@ -43,10 +49,12 @@ SHOT_TYPE_ZOOM = {
 # subject.  Panning (X) is the primary motion axis; tilt (Y) and zoom (Z) are
 # secondary, with their own deadzones, and are smoothed much more aggressively
 # to keep them nearly static.
-SMOOTHING = 0.5                   # 0–1 user-facing smoothing dial
-MAX_PAN_SPEED = 15                # Maximum pan movement in source pixels per frame
-MAX_TILT_SPEED = 3                # Maximum tilt movement in source pixels per frame (slow)
-MAX_ZOOM_SPEED = 0.015            # Maximum zoom change per frame (very slow)
+SMOOTHING = 0.5                  # 0–1 user-facing smoothing dial
+# Pan, tilt and zoom speeds all scale with how far the shot is pushed in, so
+# a tight shot keeps up with its subject the same way the wide shot does.
+MAX_PAN_SPEED = 15                # Max pan on the wide shot, reference (720p) px/frame (× zoom when pushed in)
+MAX_TILT_SPEED = 3                # Max tilt on the wide shot, reference px/frame (× zoom when pushed in)
+MAX_ZOOM_SPEED = 0.012            # Max zoom change per frame as a fraction of the current zoom
 
 # Tracking mode
 TRACKING_MODE = 'primary'         # 'primary' (follow foreground person) | 'switcher' (virtual switching)

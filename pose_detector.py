@@ -2,7 +2,8 @@
 
 import cv2
 import numpy as np
-from config import CONFIDENCE_THRESHOLD, YOLO_MODEL, DETECTION_SCALE
+import config
+from config import CONFIDENCE_THRESHOLD, YOLO_MODEL
 
 # COCO keypoint indices for the hips
 _HIP_INDICES = (11, 12)
@@ -45,6 +46,14 @@ class PoseDetector:
         print(f"Using device: {self.device}")
         self.conf_threshold = CONFIDENCE_THRESHOLD
 
+    @staticmethod
+    def detection_scale(input_width: int) -> float:
+        """Downscale factor (≤ 1.0) that brings `input_width` to DETECTION_WIDTH."""
+        target = config.DETECTION_WIDTH
+        if target <= 0 or input_width <= target:
+            return 1.0
+        return target / float(input_width)
+
     def warmup(self, width: int = 640, height: int = 360):
         """Run one throwaway inference so the first real frame isn't slow."""
         try:
@@ -70,11 +79,15 @@ class PoseDetector:
         """
         h, w = frame.shape[:2]
 
-        # Optionally downscale frame for faster inference
-        if DETECTION_SCALE < 1.0:
-            det_w = max(1, int(w * DETECTION_SCALE))
-            det_h = max(1, int(h * DETECTION_SCALE))
-            det_frame = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
+        # Downscale to DETECTION_WIDTH for inference.  The scale follows the
+        # detected input size rather than being a fixed fraction, so a 4K
+        # camera isn't handed a 1920-px frame the model would shrink anyway,
+        # and a small camera is never downscaled below its native size.
+        scale_down = self.detection_scale(w)
+        if scale_down < 1.0:
+            det_w = max(1, int(w * scale_down))
+            det_h = max(1, int(h * scale_down))
+            det_frame = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_AREA)
         else:
             det_frame = frame
             det_w, det_h = w, h

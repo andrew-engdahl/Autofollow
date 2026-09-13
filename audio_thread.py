@@ -15,6 +15,7 @@ State machine for music mode (Phase 2 spec from the user):
 
 from __future__ import annotations
 
+import importlib.util
 import time
 import numpy as np
 
@@ -44,6 +45,20 @@ _VAD_AGGRESSIVENESS = 2
 _VAD_FRAME_MS = 30
 
 
+def audio_models_installed() -> bool:
+    """True if the optional music/speech recognition stack is installed.
+
+    Checked without importing anything heavy (TensorFlow alone takes seconds),
+    so the UI can decide at launch whether there are models to wait for.
+    """
+    return all(importlib.util.find_spec(m) is not None
+               for m in ("tensorflow", "tensorflow_hub"))
+
+
+def speaker_model_installed() -> bool:
+    return importlib.util.find_spec("speechbrain") is not None
+
+
 class AudioThread(QThread):
     """Drives capture + analysis, emits state for the rest of the app to consume.
 
@@ -56,6 +71,11 @@ class AudioThread(QThread):
         voice_quiet:         emitted when VAD has been negative for >= 1 s.
         levels:              emitted every tick with the current input level.
             (rms: float)
+        models_ready:        emitted once, when the startup preload of the
+                              music classifier (and speaker model, if voices
+                              are enrolled) has finished — whether or not it
+                              succeeded.  Emitted immediately if there was
+                              nothing to preload.
     """
 
     audio_state_changed = pyqtSignal(bool, float, float)
@@ -64,6 +84,7 @@ class AudioThread(QThread):
     levels = pyqtSignal(float)
     error = pyqtSignal(str)
     status = pyqtSignal(str)          # progress text: model loading, device errors
+    models_ready = pyqtSignal()
 
     def __init__(self, profile_store: ProfileStore, parent=None):
         super().__init__(parent)
@@ -78,6 +99,11 @@ class AudioThread(QThread):
 
         self._device_index: int | None = None
         self._enabled = False
+        # Load the models up front (before the analysis loop) instead of on
+        # the first tick, so the video never stutters through a TensorFlow
+        # import mid-show.  Set before start(); no-op if nothing is installed.
+        self.preload_models: bool = False
+        self.models_loaded: bool = False
 
         # Music-mode state
         self._music_mode = False
@@ -151,6 +177,10 @@ class AudioThread(QThread):
 
     def run(self):
         self._running = True
+        if self.preload_models:
+            self._preload()
+        self.models_loaded = True
+        self.models_ready.emit()
         while self._running:
             try:
                 if self._enabled:
@@ -158,6 +188,40 @@ class AudioThread(QThread):
             except Exception as e:
                 self.error.emit(str(e))
             self.msleep(_TICK_INTERVAL_MS)
+
+    def _preload(self):
+        """Load YAMNet, and ECAPA if any profile has a voice, reporting progress."""
+        loaded = []
+        if audio_models_installed():
+            try:
+                from audio_classifier import AudioClassifier
+                self.status.emit("Loading music classifier (YAMNet)…")
+                clf = AudioClassifier()
+                clf.load()
+                self._classifier = clf
+                loaded.append("music")
+            except Exception as e:
+                print(f"AudioClassifier failed: {e}")
+                self.status.emit(f"Music detection unavailable: {e}")
+                self._classifier_failed = True
+        if not self._running:
+            return
+        has_voices = any(p.voice_embeddings is not None and len(p.voice_embeddings) > 0
+                         for p in self._store.list())
+        if speaker_model_installed() and has_voices:
+            try:
+                from speaker_recognizer import get_shared_recognizer
+                self.status.emit("Loading speaker model (ECAPA)…")
+                rec = get_shared_recognizer(self._store)
+                rec._ensure_model()
+                self._speaker_rec = rec
+                loaded.append("speaker")
+            except Exception as e:
+                print(f"SpeakerRecognizer init failed: {e}")
+                self.status.emit(f"Speaker recognition unavailable: {e}")
+                self._speaker_rec_failed = True
+        if loaded:
+            self.status.emit(f"{' & '.join(loaded).capitalize()} models ready")
 
     def get_recent_audio(self, seconds: float) -> np.ndarray | None:
         """Latest ``seconds`` of captured audio (for voice-sample recording), or None."""

@@ -7,9 +7,11 @@ panel, diagnostics and people windows read as one application.
 
 import os
 import tempfile
+import time
 
-from PyQt5.QtCore import Qt, QRectF, QSize, QPointF
-from PyQt5.QtGui import QColor, QPalette, QPainter, QImage, QPainterPath, QPen, QPixmap
+from PyQt5.QtCore import Qt, QRectF, QSize, QPointF, QTimer
+from PyQt5.QtGui import (QColor, QPalette, QPainter, QImage, QPainterPath, QPen, QPixmap,
+                         QLinearGradient)
 from PyQt5.QtWidgets import (
     QApplication, QFrame, QLabel, QVBoxLayout, QHBoxLayout, QWidget,
     QPushButton, QButtonGroup, QSizePolicy,
@@ -579,6 +581,13 @@ class VideoSurface(QWidget):
         self._radius = radius
         self._bg = QColor(background)
         self._placeholder = "No signal"
+        # Loading state: a sweeping progress track under the placeholder text,
+        # animated only while it's showing (no image on the surface).
+        self._loading = False
+        self._loading_t0 = 0.0
+        self._loading_timer = QTimer(self)
+        self._loading_timer.setInterval(33)
+        self._loading_timer.timeout.connect(self.update)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(160, 90)
 
@@ -597,6 +606,23 @@ class VideoSurface(QWidget):
         if self._image is None:
             self.update()
 
+    def set_loading(self, text: str | None):
+        """Show an animated loading indicator with ``text`` (None to clear)."""
+        was_loading = self._loading
+        self._loading = text is not None
+        if self._loading:
+            self._placeholder = text
+            if not was_loading:
+                self._loading_t0 = time.monotonic()
+                self._loading_timer.start()
+        else:
+            self._loading_timer.stop()
+        self.update()
+
+    @property
+    def is_loading(self) -> bool:
+        return self._loading
+
     def set_image(self, img: QImage | None):
         self._image = img
         self.update()
@@ -612,11 +638,14 @@ class VideoSurface(QWidget):
         p.fillRect(rect, self._bg)
 
         if self._image is None or self._image.isNull():
-            p.setPen(QColor(DIM))
+            p.setPen(QColor(MUTED if self._loading else DIM))
             f = p.font()
             f.setPointSize(12)
             p.setFont(f)
-            p.drawText(rect, Qt.AlignCenter, self._placeholder)
+            text_rect = rect.adjusted(0, 0, 0, -16 if self._loading else 0)
+            p.drawText(text_rect, Qt.AlignCenter, self._placeholder)
+            if self._loading:
+                self._draw_loader(p, rect)
             return
 
         iw, ih = self._image.width(), self._image.height()
@@ -625,6 +654,25 @@ class VideoSurface(QWidget):
         target = QRectF(rect.x() + (rect.width() - dw) / 2.0,
                         rect.y() + (rect.height() - dh) / 2.0, dw, dh)
         p.drawImage(target, self._image)
+
+
+    def _draw_loader(self, p: QPainter, rect: QRectF):
+        """Thin track with a sweeping accent highlight, like the splash loader."""
+        w = min(240.0, rect.width() * 0.4)
+        track = QRectF(rect.center().x() - w / 2, rect.center().y() + 18, w, 4)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(BORDER))
+        p.drawRoundedRect(track, 2, 2)
+        t = time.monotonic() - self._loading_t0
+        span = 0.28
+        pos = (t * 0.45) % (1.0 + span) - span
+        sweep = QLinearGradient(track.left() + pos * w, 0, track.left() + (pos + span) * w, 0)
+        a0 = QColor(ACCENT); a0.setAlpha(0)
+        sweep.setColorAt(0.0, a0)
+        sweep.setColorAt(0.5, QColor(ACCENT))
+        sweep.setColorAt(1.0, a0)
+        p.setBrush(sweep)
+        p.drawRoundedRect(track, 2, 2)
 
 
 class Dot(QLabel):

@@ -140,9 +140,11 @@ class EditProfileDialog(QDialog):
         form.addRow("Priority:", prio_w)
 
         prio_hint = QLabel(
-            "0 = normal · 5 = preferred · 10 = always preferred\n"
+            "0 = normal · 5 = preferred · 10 = locked on\n"
             "High-priority people get longer dwell on the auto-switcher\n"
-            "and win contests over unmatched bystanders in primary mode."
+            "and win contests over unmatched bystanders in primary mode.\n"
+            "At 10, Primary mode follows them whenever they're on screen\n"
+            "and nobody else can take over."
         )
         prio_hint.setStyleSheet("color: gray; font-size: 10px;")
         form.addRow("", prio_hint)
